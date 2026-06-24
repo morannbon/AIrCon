@@ -1,0 +1,34 @@
+﻿Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AIrCon.BasicPlugin", "AIrCon.BasicPlugin\AIrCon.BasicPlugin.csproj", "{02C13F99-6510-41C5-85B2-100000000400}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TvAIrPlugin", "TvAIrPlugin\TvAIrPlugin.csproj", "{02C13F99-6510-41C5-85B2-100000010038}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{02C13F99-6510-41C5-85B2-100000000400}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{02C13F99-6510-41C5-85B2-100000000400}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{02C13F99-6510-41C5-85B2-100000000400}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{02C13F99-6510-41C5-85B2-100000000400}.Release|Any CPU.Build.0 = Release|Any CPU
+		{02C13F99-6510-41C5-85B2-100000000400}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{02C13F99-6510-41C5-85B2-100000000400}.Debug|x64.Build.0 = Debug|Any CPU
+		{02C13F99-6510-41C5-85B2-100000000400}.Release|x64.ActiveCfg = Release|Any CPU
+		{02C13F99-6510-41C5-85B2-100000000400}.Release|x64.Build.0 = Release|Any CPU
+		{02C13F99-6510-41C5-85B2-100000010038}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{02C13F99-6510-41C5-85B2-100000010038}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{02C13F99-6510-41C5-85B2-100000010038}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{02C13F99-6510-41C5-85B2-100000010038}.Release|Any CPU.Build.0 = Release|Any CPU
+		{02C13F99-6510-41C5-85B2-100000010038}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{02C13F99-6510-41C5-85B2-100000010038}.Debug|x64.Build.0 = Debug|Any CPU
+		{02C13F99-6510-41C5-85B2-100000010038}.Release|x64.ActiveCfg = Release|Any CPU
+		{02C13F99-6510-41C5-85B2-100000010038}.Release|x64.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal
