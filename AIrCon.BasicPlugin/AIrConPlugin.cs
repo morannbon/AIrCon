@@ -9,8 +9,9 @@ namespace AIrCon.BasicPlugin;
 /// </summary>
 public sealed class AIrConPlugin : IUiPlugin, IManifestPlugin, IViewerPlugin
 {
-    private const string PluginVersion = "1.0.0";
+    private const string PluginVersion = "1.0.1";
     private const string PluginListTitle = "AIrCon";
+    private static string PluginToolWindowTitle => $"AIrCon v{PluginVersion}";
     private const string PluginId = "aircon.basic";
     private const string RouteSegment = "aircon";
     private const string ClientVersion = "AIrCon-" + PluginVersion;
@@ -102,7 +103,8 @@ public sealed class AIrConPlugin : IUiPlugin, IManifestPlugin, IViewerPlugin
         DefaultMenuActionKind = "toolWindow",
         DefaultMenuActionLabel = PluginListTitle,
         DefaultMenuActionPriority = 420,
-        ToolWindowShowInTaskbar = true
+        ToolWindowShowInTaskbar = true,
+        ToolWindowTitle = PluginToolWindowTitle
     };
 
     public ViewerPluginCapabilities Capabilities { get; } = new()
@@ -122,7 +124,8 @@ public sealed class AIrConPlugin : IUiPlugin, IManifestPlugin, IViewerPlugin
         Entry = "AIrCon.BasicPlugin.AIrConPlugin",
         Description = "常駐型小型リモコン視聴パネル",
         Vendor = "AIrCon Plugin Team",
-        HostContractVersion = "0.11.315",
+        HostContractVersion = TvAIrPluginSdkContract.HostContractVersion,
+        SdkVersion = TvAIrPluginSdkContract.SdkVersion,
         Capabilities = new[]
         {
             "ShowUi",
@@ -150,6 +153,7 @@ public sealed class AIrConPlugin : IUiPlugin, IManifestPlugin, IViewerPlugin
         DefaultMenuActionLabel = PluginListTitle,
         DefaultMenuActionPriority = 420,
         ToolWindowShowInTaskbar = true,
+        ToolWindowTitle = PluginToolWindowTitle,
         Kind = new[] { "Viewer", "UI" },
         Permissions = new[]
         {
@@ -174,7 +178,7 @@ public sealed class AIrConPlugin : IUiPlugin, IManifestPlugin, IViewerPlugin
     public void Initialize(IPluginContext context)
     {
         _context = context;
-        SafeLog("Initialize completed. AIrCon v1.0.0.");
+        SafeLog("Initialize completed. AIrCon v1.0.1.");
     }
 
     public void OnStart() => SafeLog("OnStart completed.");
@@ -302,7 +306,7 @@ private string ResolveRequestedViewerProfile(IReadOnlyDictionary<string, string>
     {
         try
         {
-            // official: TvAIr v0.11.72+ projects TVTest-instance viewer profiles into PluginUiContext.
+            // official: TvAIr release_contract projects TVTest-instance viewer profiles into PluginUiContext.
             // Prefer the RenderHtml context over IPluginContext/fallback so host-generated
             // selectableViewerProfiles/defaultViewerProfile/availableGroups are not lost.
             var contextSource = ReadProperty(context, "ViewerProfilesContract")
@@ -824,7 +828,7 @@ private string ResolveRequestedViewerProfile(IReadOnlyDictionary<string, string>
             }
         }
 
-        // TvAIr v0.11.52+ scopes viewer leases by profile: <pluginId>:viewer:<profileId>.
+        // TvAIr release_contract scopes viewer leases by profile: <pluginId>:viewer:<profileId>.
         // Querying the legacy <pluginId>:viewer client only misses active sessions and breaks highlight/anchor.
         AddSessions("all_aircon_prefix", new PluginViewerSessionQuery(), filterByAirConClientPrefix: true);
         AddSessions("legacy", new PluginViewerSessionQuery { ClientId = PluginId + ":viewer" }, filterByAirConClientPrefix: false);
@@ -1177,7 +1181,7 @@ private string ResolveRequestedViewerProfile(IReadOnlyDictionary<string, string>
     private static string ResolveWindowStateEndpoint(PluginUiContext c, IReadOnlyDictionary<string, string> contract, string windowId)
     {
         // Compatibility only: official no longer calls this endpoint from RenderHtml.
-        // TvAIr v0.11.13 supplies direct CurrentWindowAlwaysOnTop state instead.
+        // TvAIr release_contract supplies direct CurrentWindowAlwaysOnTop state instead.
         var escapedWindowId = Uri.EscapeDataString(windowId ?? string.Empty);
         var absolute = FirstNonEmpty(
             ReadString(c, "CurrentWindowStateUrl", "WindowStateUrl", "AbsoluteWindowStateUrl", "CurrentWindowStateAbsoluteUrl"),
@@ -1206,7 +1210,7 @@ private string ResolveRequestedViewerProfile(IReadOnlyDictionary<string, string>
     {
         if (!isToolWindow || string.IsNullOrWhiteSpace(window.WindowId)) return false;
 
-        // TvAIr v0.11.13 contract: RenderHtml must not synchronously call WindowStateUrl.
+        // TvAIr release_contract: RenderHtml must not synchronously call WindowStateUrl.
         // The host injects the current tool-window state directly into PluginUiContext / WindowContract.
         if (TryReadBoolProperty(context, out var directValue, "CurrentWindowAlwaysOnTop", "WindowAlwaysOnTop"))
         {

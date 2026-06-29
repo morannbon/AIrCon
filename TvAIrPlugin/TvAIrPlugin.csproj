@@ -1,18 +1,27 @@
 <Project Sdk="Microsoft.NET.Sdk">
+
   <PropertyGroup>
+    <Platforms>AnyCPU;x86;x64</Platforms>
     <TargetFramework>net8.0-windows</TargetFramework>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>TvAIrPlugin</RootNamespace>
     <AssemblyName>TvAIrPlugin</AssemblyName>
-    <Version>1.0.4</Version>
-    <FileVersion>0.11.315.0</FileVersion>
-    <AssemblyVersion>1.0.4.0</AssemblyVersion>
-    <InformationalVersion>0.11.315-plugin-host-contract-foundation</InformationalVersion>
+    <Version>$(TvAIrPluginSdkVersion)</Version>
+    <FileVersion>$(TvAIrFileVersion)</FileVersion>
+    <AssemblyVersion>$(TvAIrPluginSdkAssemblyVersion)</AssemblyVersion>
+    <InformationalVersion>$(TvAIrPluginSdkVersion)</InformationalVersion>
+    <!-- TvAIr 1.0.0 を Plugin SDK の新しい互換開始点とする。旧0.x SDK互換は維持しない。 -->
     <OutputType>Library</OutputType>
   </PropertyGroup>
-  <Target Name="EnsureRestoreAssets" BeforeTargets="PrepareForBuild" Condition="!Exists('$(ProjectAssetsFile)')">
-    <MSBuild Projects="$(MSBuildProjectFullPath)" Targets="Restore" Properties="Configuration=$(Configuration);Platform=$(Platform)" />
-  </Target>
+
+  <PropertyGroup Condition="'$(Platform)'=='x86'">
+    <PlatformTarget>x86</PlatformTarget>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Platform)'=='x64'">
+    <PlatformTarget>x64</PlatformTarget>
+  </PropertyGroup>
+
 </Project>

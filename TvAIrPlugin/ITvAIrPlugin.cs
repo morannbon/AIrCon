@@ -1,4 +1,4 @@
-namespace TvAIrPlugin;
+﻿namespace TvAIrPlugin;
 
 /// <summary>
 /// TvAIr プラグインの契約インターフェース。

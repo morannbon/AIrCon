@@ -1,4 +1,4 @@
-AIrCon v1.0.0
+AIrCon v1.0.1
 ==============================
 
 TvAIr 用の視聴操作プラグインです。
@@ -21,6 +21,7 @@ TvAIrPlugin\
   ITvAIrPlugin.cs
   PluginContracts.cs
   TvAIrPlugin.csproj
+  TvAIrPluginSdkContract.generated.cs
 
 
 動作条件
@@ -45,13 +46,17 @@ AIrCon.BasicPlugin\bin\Release\AIrCon.BasicPlugin.dll
 インストール
 ------------------------------
 
-以下の DLL をコピーします。
+以下のファイルをコピーします。
 
 AIrCon.BasicPlugin\bin\Release\AIrCon.BasicPlugin.dll
+AIrCon.BasicPlugin.plugin.json
+AIrCon.BasicPlugin\AIrCon.ico
 
 コピー先:
 
 TvAIr\Plugins\AIrCon.BasicPlugin.dll
+TvAIr\Plugins\AIrCon.BasicPlugin.plugin.json
+TvAIr\Plugins\AIrCon.ico
 
 コピー後、TvAIr を再起動します。
 
@@ -72,6 +77,8 @@ TvAIr\Plugins\AIrCon.BasicPlugin.dll
 以下のファイルを削除します。
 
 TvAIr\Plugins\AIrCon.BasicPlugin.dll
+TvAIr\Plugins\AIrCon.BasicPlugin.plugin.json
+TvAIr\Plugins\AIrCon.ico
 
 削除後、TvAIr を再起動します。
 
@@ -79,4 +86,4 @@ TvAIr\Plugins\AIrCon.BasicPlugin.dll
 バージョン
 ------------------------------
 
-AIrCon v1.0.0
+AIrCon v1.0.1
