@@ -215,7 +215,7 @@ public sealed class AIrConPlugin : IUiPlugin, IManifestPlugin, IViewerPlugin
                 }
             }
 
-            SafeLog($"RenderHtml route=aircon mode=viewer_release_1_0_0 toolWindow={isToolWindow} requestedWave={requestedWave} effectiveWave={filter} viewerProfile={selectedViewerProfile.Value} selectorVisible={viewerProfiles.SelectorVisibleRecommended} profiles={viewerProfiles.SelectableProfiles.Count} services={data.Services.Count} viewers={data.ViewerSessions.Count} activeViewers={data.ViewerSessions.Count(x => x.IsActive)} highlighted={data.Services.Count(x => x.IsViewing)} projectionUsed={data.ProjectionUsed}");
+            SafeLog($"RenderHtml route=aircon mode=viewer_release_1_0_1 toolWindow={isToolWindow} requestedWave={requestedWave} effectiveWave={filter} viewerProfile={selectedViewerProfile.Value} selectorVisible={viewerProfiles.SelectorVisibleRecommended} profiles={viewerProfiles.SelectableProfiles.Count} services={data.Services.Count} viewers={data.ViewerSessions.Count} activeViewers={data.ViewerSessions.Count(x => x.IsActive)} highlighted={data.Services.Count(x => x.IsViewing)} projectionUsed={data.ProjectionUsed}");
 
             return isToolWindow
                 ? BuildFloatingViewerHtml(data, action, window, filter, selectedTunerValue, selectedViewerProfile, alwaysOnTop)
@@ -306,7 +306,7 @@ private string ResolveRequestedViewerProfile(IReadOnlyDictionary<string, string>
     {
         try
         {
-            // official: TvAIr release_contract projects TVTest-instance viewer profiles into PluginUiContext.
+            // official: TvAIr SDK contract projects TVTest-instance viewer profiles into PluginUiContext.
             // Prefer the RenderHtml context over IPluginContext/fallback so host-generated
             // selectableViewerProfiles/defaultViewerProfile/availableGroups are not lost.
             var contextSource = ReadProperty(context, "ViewerProfilesContract")
@@ -828,7 +828,7 @@ private string ResolveRequestedViewerProfile(IReadOnlyDictionary<string, string>
             }
         }
 
-        // TvAIr release_contract scopes viewer leases by profile: <pluginId>:viewer:<profileId>.
+        // TvAIr SDK contract scopes viewer leases by profile: <pluginId>:viewer:<profileId>.
         // Querying the legacy <pluginId>:viewer client only misses active sessions and breaks highlight/anchor.
         AddSessions("all_aircon_prefix", new PluginViewerSessionQuery(), filterByAirConClientPrefix: true);
         AddSessions("legacy", new PluginViewerSessionQuery { ClientId = PluginId + ":viewer" }, filterByAirConClientPrefix: false);
@@ -1181,7 +1181,7 @@ private string ResolveRequestedViewerProfile(IReadOnlyDictionary<string, string>
     private static string ResolveWindowStateEndpoint(PluginUiContext c, IReadOnlyDictionary<string, string> contract, string windowId)
     {
         // Compatibility only: official no longer calls this endpoint from RenderHtml.
-        // TvAIr release_contract supplies direct CurrentWindowAlwaysOnTop state instead.
+        // TvAIr SDK contract supplies direct CurrentWindowAlwaysOnTop state instead.
         var escapedWindowId = Uri.EscapeDataString(windowId ?? string.Empty);
         var absolute = FirstNonEmpty(
             ReadString(c, "CurrentWindowStateUrl", "WindowStateUrl", "AbsoluteWindowStateUrl", "CurrentWindowStateAbsoluteUrl"),
@@ -1210,7 +1210,7 @@ private string ResolveRequestedViewerProfile(IReadOnlyDictionary<string, string>
     {
         if (!isToolWindow || string.IsNullOrWhiteSpace(window.WindowId)) return false;
 
-        // TvAIr release_contract: RenderHtml must not synchronously call WindowStateUrl.
+        // TvAIr SDK contract: RenderHtml must not synchronously call WindowStateUrl.
         // The host injects the current tool-window state directly into PluginUiContext / WindowContract.
         if (TryReadBoolProperty(context, out var directValue, "CurrentWindowAlwaysOnTop", "WindowAlwaysOnTop"))
         {

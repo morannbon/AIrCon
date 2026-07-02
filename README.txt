@@ -10,6 +10,7 @@ TvAIr 用の視聴操作プラグインです。
 README.txt
 AIrCon.BasicPlugin.sln
 AIrCon.BasicPlugin.plugin.json
+.gitignore
 
 AIrCon.BasicPlugin\
   AIrCon.BasicPlugin.csproj
@@ -21,13 +22,13 @@ TvAIrPlugin\
   ITvAIrPlugin.cs
   PluginContracts.cs
   TvAIrPlugin.csproj
-  TvAIrPluginSdkContract.generated.cs
+  TvAIrPluginSdkContract.cs
 
 
 動作条件
 ------------------------------
 
-- TvAIr
+- TvAIr 1.0.8 以降
 - Visual Studio 2022
 - .NET 8.0 Windows Desktop Runtime / SDK
 

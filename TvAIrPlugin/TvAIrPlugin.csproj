@@ -8,11 +8,10 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>TvAIrPlugin</RootNamespace>
     <AssemblyName>TvAIrPlugin</AssemblyName>
-    <Version>$(TvAIrPluginSdkVersion)</Version>
-    <FileVersion>$(TvAIrFileVersion)</FileVersion>
-    <AssemblyVersion>$(TvAIrPluginSdkAssemblyVersion)</AssemblyVersion>
-    <InformationalVersion>$(TvAIrPluginSdkVersion)</InformationalVersion>
-    <!-- TvAIr 1.0.0 を Plugin SDK の新しい互換開始点とする。旧0.x SDK互換は維持しない。 -->
+    <Version>1.0.0</Version>
+    <FileVersion>1.0.0.0</FileVersion>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <InformationalVersion>1.0.0</InformationalVersion>
     <OutputType>Library</OutputType>
   </PropertyGroup>
 
