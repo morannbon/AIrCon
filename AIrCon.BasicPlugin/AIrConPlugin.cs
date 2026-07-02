@@ -9,7 +9,7 @@ namespace AIrCon.BasicPlugin;
 /// </summary>
 public sealed class AIrConPlugin : IUiPlugin, IManifestPlugin, IViewerPlugin
 {
-    private const string PluginVersion = "1.0.1";
+    private const string PluginVersion = "1.0.2";
     private const string PluginListTitle = "AIrCon";
     private static string PluginToolWindowTitle => $"AIrCon v{PluginVersion}";
     private const string PluginId = "aircon.basic";
@@ -53,7 +53,10 @@ public sealed class AIrConPlugin : IUiPlugin, IManifestPlugin, IViewerPlugin
     private const int ToolWindowWaveButtonOverlapPx = ToolWindowButtonBorderPx;
     private const int ToolWindowToolbarSeparatorPx = 1;
     private const int ToolWindowRowHeightPx = 30;
-    private const int ToolWindowServiceColumnWidthPx = 132;
+    private const int ToolWindowServiceColumnMinimumWidthPx = 132;
+    private const int ToolWindowServiceColumnMaximumWidthPx = 240;
+    private const int ToolWindowServiceColumnHorizontalReservePx = 12;
+    private const int ToolWindowTimeColumnWidthPx = 42;
     private const string CurrentViewingAnchorId = "aircon-current-viewing-anchor";
     private const string RefreshScrollModeCenter = "center";
 
@@ -178,7 +181,7 @@ public sealed class AIrConPlugin : IUiPlugin, IManifestPlugin, IViewerPlugin
     public void Initialize(IPluginContext context)
     {
         _context = context;
-        SafeLog("Initialize completed. AIrCon v1.0.1.");
+        SafeLog($"Initialize completed. AIrCon v{PluginVersion}.");
     }
 
     public void OnStart() => SafeLog("OnStart completed.");
@@ -215,7 +218,7 @@ public sealed class AIrConPlugin : IUiPlugin, IManifestPlugin, IViewerPlugin
                 }
             }
 
-            SafeLog($"RenderHtml route=aircon mode=viewer_release_1_0_1 toolWindow={isToolWindow} requestedWave={requestedWave} effectiveWave={filter} viewerProfile={selectedViewerProfile.Value} selectorVisible={viewerProfiles.SelectorVisibleRecommended} profiles={viewerProfiles.SelectableProfiles.Count} services={data.Services.Count} viewers={data.ViewerSessions.Count} activeViewers={data.ViewerSessions.Count(x => x.IsActive)} highlighted={data.Services.Count(x => x.IsViewing)} projectionUsed={data.ProjectionUsed}");
+            SafeLog($"RenderHtml route=aircon mode=viewer_1_0_2 toolWindow={isToolWindow} requestedWave={requestedWave} effectiveWave={filter} viewerProfile={selectedViewerProfile.Value} selectorVisible={viewerProfiles.SelectorVisibleRecommended} profiles={viewerProfiles.SelectableProfiles.Count} services={data.Services.Count} viewers={data.ViewerSessions.Count} activeViewers={data.ViewerSessions.Count(x => x.IsActive)} highlighted={data.Services.Count(x => x.IsViewing)} projectionUsed={data.ProjectionUsed}");
 
             return isToolWindow
                 ? BuildFloatingViewerHtml(data, action, window, filter, selectedTunerValue, selectedViewerProfile, alwaysOnTop)
@@ -639,8 +642,18 @@ private string ResolveRequestedViewerProfile(IReadOnlyDictionary<string, string>
                 var rows = (snapshot.NowNext ?? Array.Empty<PluginProgramGuideNowNext>()).ToList();
                 if (services.Count > 0)
                 {
+                    var beforePrune = services.Count;
                     var applied = ApplyNowNextFromSnapshot(services, rows);
-                    diagnostics.Add("programGuideSnapshot=V3 overlayNowNext=" + applied + " base=ViewerControlChannels revision=" + snapshot.Revision);
+                    if (rows.Count > 0)
+                    {
+                        services = services
+                            .Where(x => x.HasCurrentProgramProjection)
+                            .OrderBy(x => x.ProgramGuideOrder)
+                            .ToList();
+                    }
+                    diagnostics.Add("programGuideSnapshot=V3 overlayNowNext=" + applied
+                        + " pruned=" + (beforePrune - services.Count)
+                        + " base=ViewerControlChannels revision=" + snapshot.Revision);
                 }
                 else if (rows.Count > 0)
                 {
@@ -677,44 +690,6 @@ private string ResolveRequestedViewerProfile(IReadOnlyDictionary<string, string>
             catch (Exception ex) { diagnostics.Add("viewerSessions exception=" + ex.Message); }
         }
 
-        var zeroTripletBeforeCurrentFallback = services.Count(x => x.NetworkId <= 0 || x.TransportStreamId <= 0 || x.ServiceId <= 0);
-        if (zeroTripletBeforeCurrentFallback > 0 && _context is IPluginReadContextV2 v2)
-        {
-            try
-            {
-                var restored = ApplyTripletFromCurrentPrograms(services, v2.GetCurrentPrograms(new PluginCurrentProgramQuery()) ?? Array.Empty<PluginEpgEvent>());
-                var zeroTripletAfterCurrentFallback = services.Count(x => x.NetworkId <= 0 || x.TransportStreamId <= 0 || x.ServiceId <= 0);
-                diagnostics.Add($"tripletCurrentProgramFallback before={zeroTripletBeforeCurrentFallback} restored={restored} after={zeroTripletAfterCurrentFallback}");
-                if (zeroTripletAfterCurrentFallback > 0)
-                {
-                    SafeLog("TRIPLET_DIAG zeroAfterCurrentFallback=" + zeroTripletAfterCurrentFallback);
-                }
-            }
-            catch (Exception ex)
-            {
-                diagnostics.Add("tripletCurrentProgramFallback exception=" + ex.Message);
-                SafeLog("TRIPLET_DIAG currentProgramFallbackException=" + ex.Message);
-            }
-        }
-
-        var zeroTripletBeforeChannelFallback = services.Count(x => x.NetworkId <= 0 || x.TransportStreamId <= 0 || x.ServiceId <= 0);
-        if (zeroTripletBeforeChannelFallback > 0 && _context is IPluginExtendedContextV1 ext)
-        {
-            try
-            {
-                var channels = ext.GetChannels(new PluginChannelQuery()) ?? Array.Empty<PluginChannelInfo>();
-                var restored = ApplyTripletFromChannels(services, channels);
-                var zeroTripletAfterChannelFallback = services.Count(x => x.NetworkId <= 0 || x.TransportStreamId <= 0 || x.ServiceId <= 0);
-                diagnostics.Add($"tripletChannelFallback before={zeroTripletBeforeChannelFallback} restored={restored} after={zeroTripletAfterChannelFallback} source=GetChannels");
-                SafeLog("TRIPLET_DIAG channelFallback before=" + zeroTripletBeforeChannelFallback + " restored=" + restored + " after=" + zeroTripletAfterChannelFallback);
-            }
-            catch (Exception ex)
-            {
-                diagnostics.Add("tripletChannelFallback exception=" + ex.Message);
-                SafeLog("TRIPLET_DIAG channelFallbackException=" + ex.Message);
-            }
-        }
-
         var zeroTripletFinal = services.Count(x => x.NetworkId <= 0 || x.TransportStreamId <= 0 || x.ServiceId <= 0);
         if (zeroTripletFinal > 0)
         {
@@ -739,11 +714,7 @@ private string ResolveRequestedViewerProfile(IReadOnlyDictionary<string, string>
                 if (s.NetworkId == null || s.TransportStreamId == null || s.ServiceId == null) continue;
                 if (!map.TryGetValue(ServiceKey(s.NetworkId.Value, s.TransportStreamId.Value, s.ServiceId.Value), out var row)) continue;
                 row.IsViewing = true;
-                row.ViewingLeaseId = s.LeaseId;
-                row.ViewingTunerName = s.TunerName;
-                row.ViewingDid = s.Did;
                 row.ViewingViewerProfile = s.ViewerProfile;
-                row.ViewingViewerProfileName = s.ViewerProfileName;
             }
         }
 
@@ -760,18 +731,10 @@ private string ResolveRequestedViewerProfile(IReadOnlyDictionary<string, string>
                 foreach (var row in services)
                 {
                     row.IsViewing = false;
-                    row.ViewingLeaseId = string.Empty;
-                    row.ViewingTunerName = string.Empty;
-                    row.ViewingDid = string.Empty;
                     row.ViewingViewerProfile = string.Empty;
-                    row.ViewingViewerProfileName = string.Empty;
                 }
                 focused.IsViewing = true;
-                focused.ViewingLeaseId = "focus-triplet";
-                focused.ViewingTunerName = string.Empty;
-                focused.ViewingDid = string.Empty;
                 focused.ViewingViewerProfile = string.Empty;
-                focused.ViewingViewerProfileName = string.Empty;
                 focusHighlighted = 1;
             }
             else if (focusAlreadyHighlighted)
@@ -782,7 +745,7 @@ private string ResolveRequestedViewerProfile(IReadOnlyDictionary<string, string>
         diagnostics.Add("currentRowHighlight session=" + sessionHighlighted + " focus=" + focusHighlighted + " focusTriplet=" + focusTriplet.ToLogString());
         if (focusTriplet.IsResolved)
         {
-            SafeLog("CURRENT_ROW_ANCHOR_FOCUS focus=" + focusTriplet.ToLogString() + " applied=" + focusHighlighted + " sessionHighlighted=" + sessionHighlighted + " rule=aircon_release");
+            SafeLog("CURRENT_ROW_ANCHOR_FOCUS focus=" + focusTriplet.ToLogString() + " applied=" + focusHighlighted + " sessionHighlighted=" + sessionHighlighted + " rule=current_anchor_focus");
         }
 
         var filtered = services
@@ -795,7 +758,9 @@ private string ResolveRequestedViewerProfile(IReadOnlyDictionary<string, string>
             + " renderedCount=" + filtered.Count
             + " rule=program_guide_projection_group_first_fallback_chspace");
 
-        return new FloatingViewerData(filtered, sessions, tuners, waveFilters, viewerProfiles, diagnostics, projectionUsed, safeEventContractAvailable, safeDblclickEvents);
+        var serviceColumnWidth = CalculateServiceColumnWidth(services);
+
+        return new FloatingViewerData(filtered, sessions, tuners, waveFilters, viewerProfiles, diagnostics, projectionUsed, safeEventContractAvailable, safeDblclickEvents, serviceColumnWidth);
     }
 
     private static List<ViewerSessionRow> CaptureViewerSessions(IPluginReadContextV3 v3, ViewerProfileState viewerProfiles, List<string> diagnostics)
@@ -900,25 +865,36 @@ private string ResolveRequestedViewerProfile(IReadOnlyDictionary<string, string>
             .Where(HasResolvedTriplet)
             .GroupBy(x => ServiceKey(x.NetworkId, x.TransportStreamId, x.ServiceId), StringComparer.OrdinalIgnoreCase)
             .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
-        var byName = services
-            .Where(x => !string.IsNullOrWhiteSpace(x.ServiceName))
-            .GroupBy(x => NormalizeServiceKey(x.ServiceName), StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
 
         var applied = 0;
         foreach (var item in rows)
         {
-            ServiceRow? row = null;
-            if (item.Channel.NetworkId > 0 && item.Channel.TransportStreamId > 0 && item.Channel.ServiceId > 0)
-            {
-                byTriplet.TryGetValue(ServiceKey(item.Channel.NetworkId, item.Channel.TransportStreamId, item.Channel.ServiceId), out row);
-            }
-            row ??= byName.TryGetValue(NormalizeServiceKey(item.Channel.ServiceName), out var byServiceName) ? byServiceName : null;
-            if (row == null) continue;
+            if (!TryResolveNowNextServiceKey(item, out var key)) continue;
+            if (!byTriplet.TryGetValue(key, out var row)) continue;
             ApplyNowNext(row, item);
             applied++;
         }
         return applied;
+    }
+
+    private static bool TryResolveNowNextServiceKey(PluginProgramGuideNowNext item, out string key)
+    {
+        key = string.Empty;
+        var nid = FirstPositive(
+            item.Channel.NetworkId,
+            item.Current?.NetworkId ?? 0,
+            item.Next?.NetworkId ?? 0);
+        var tsid = FirstPositive(
+            item.Channel.TransportStreamId,
+            item.Current?.TransportStreamId ?? 0,
+            item.Next?.TransportStreamId ?? 0);
+        var sid = FirstPositive(
+            item.Channel.ServiceId,
+            item.Current?.ServiceId ?? 0,
+            item.Next?.ServiceId ?? 0);
+        if (nid <= 0 || tsid <= 0 || sid <= 0) return false;
+        key = ServiceKey(nid, tsid, sid);
+        return true;
     }
 
     private static bool IsVisibleChannel(PluginProgramGuideChannel c)
@@ -981,13 +957,11 @@ private string ResolveRequestedViewerProfile(IReadOnlyDictionary<string, string>
             row.CurrentTitle = FirstNonEmpty(item.Current.Title, "番組情報取得中");
             row.CurrentStart = item.Current.Start;
             row.CurrentEnd = item.Current.End;
+            row.HasCurrentProgramProjection = true;
         }
         if (item.Next != null)
         {
             ApplyTriplet(row, item.Next.NetworkId, item.Next.TransportStreamId, item.Next.ServiceId);
-            row.NextTitle = item.Next.Title;
-            row.NextStart = item.Next.Start;
-            row.NextEnd = item.Next.End;
         }
     }
 
@@ -1032,85 +1006,6 @@ private string ResolveRequestedViewerProfile(IReadOnlyDictionary<string, string>
         }
         return false;
     }
-
-    private static int ApplyTripletFromCurrentPrograms(IReadOnlyList<ServiceRow> rows, IReadOnlyList<PluginEpgEvent> events)
-    {
-        if (rows.Count == 0 || events.Count == 0) return 0;
-        var restored = 0;
-        var eventsByService = events
-            .Where(e => !string.IsNullOrWhiteSpace(e.ServiceName) && e.NetworkId > 0 && e.TransportStreamId > 0 && e.ServiceId > 0)
-            .GroupBy(e => NormalizeServiceKey(e.ServiceName), StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.OrdinalIgnoreCase);
-
-        foreach (var row in rows)
-        {
-            if (row.NetworkId > 0 && row.TransportStreamId > 0 && row.ServiceId > 0) continue;
-            if (!eventsByService.TryGetValue(NormalizeServiceKey(row.ServiceName), out var candidates) || candidates.Count == 0) continue;
-
-            var selected = candidates.FirstOrDefault(e => !string.IsNullOrWhiteSpace(row.CurrentTitle) &&
-                e.Title.Equals(row.CurrentTitle, StringComparison.OrdinalIgnoreCase))
-                ?? candidates[0];
-            var before = row.NetworkId > 0 && row.TransportStreamId > 0 && row.ServiceId > 0;
-            ApplyTriplet(row, selected.NetworkId, selected.TransportStreamId, selected.ServiceId);
-            var after = row.NetworkId > 0 && row.TransportStreamId > 0 && row.ServiceId > 0;
-            if (!before && after) restored++;
-        }
-        return restored;
-    }
-
-    private static int ApplyTripletFromChannels(IReadOnlyList<ServiceRow> rows, IReadOnlyList<PluginChannelInfo> channels)
-    {
-        if (rows.Count == 0 || channels.Count == 0) return 0;
-        var restored = 0;
-        var enabledChannels = channels
-            .Where(c => c.IsEnabledInUserChannelSet && c.NetworkId > 0 && c.TransportStreamId > 0 && c.ServiceId > 0 && !string.IsNullOrWhiteSpace(c.ServiceName))
-            .ToList();
-
-        var byService = enabledChannels
-            .GroupBy(c => NormalizeServiceKey(c.ServiceName), StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.OrdinalIgnoreCase);
-
-        foreach (var row in rows)
-        {
-            if (row.NetworkId > 0 && row.TransportStreamId > 0 && row.ServiceId > 0) continue;
-            if (!byService.TryGetValue(NormalizeServiceKey(row.ServiceName), out var candidates) || candidates.Count == 0) continue;
-
-            var selected = SelectBestChannelCandidate(row, candidates);
-            var before = row.NetworkId > 0 && row.TransportStreamId > 0 && row.ServiceId > 0;
-            ApplyTriplet(row, selected.NetworkId, selected.TransportStreamId, selected.ServiceId);
-            if (row.ChannelSpace <= 0 && selected.ChannelSpace > 0) row.ChannelSpace = selected.ChannelSpace;
-            if (row.ChannelIndex <= 0 && selected.ChannelIndex > 0) row.ChannelIndex = selected.ChannelIndex;
-            if (string.IsNullOrWhiteSpace(row.ChannelArgument)) row.ChannelArgument = selected.ChannelArgument;
-            if (string.IsNullOrWhiteSpace(row.AllocationGroup)) row.AllocationGroup = selected.Group.Equals("GR", StringComparison.OrdinalIgnoreCase) ? "GR" : "BSCS";
-            if (string.IsNullOrWhiteSpace(row.TunerGroup)) row.TunerGroup = row.AllocationGroup;
-            var after = row.NetworkId > 0 && row.TransportStreamId > 0 && row.ServiceId > 0;
-            if (!before && after) restored++;
-        }
-        return restored;
-    }
-
-    private static PluginChannelInfo SelectBestChannelCandidate(ServiceRow row, IReadOnlyList<PluginChannelInfo> candidates)
-    {
-        if (candidates.Count == 1) return candidates[0];
-        var allocationGroup = FirstNonEmpty(row.AllocationGroup, row.TunerGroup, row.ProgramGuideFilterGroup == "GR" ? "GR" : "BSCS");
-        var byGroup = candidates.FirstOrDefault(c =>
-            c.Group.Equals(row.ProgramGuideFilterGroup, StringComparison.OrdinalIgnoreCase)
-            || c.Group.Equals(allocationGroup, StringComparison.OrdinalIgnoreCase)
-            || (allocationGroup.Equals("BSCS", StringComparison.OrdinalIgnoreCase) && !c.Group.Equals("GR", StringComparison.OrdinalIgnoreCase)));
-        if (byGroup != null) return byGroup;
-        if (row.ChannelSpace > 0 || row.ChannelIndex > 0)
-        {
-            var byChannel = candidates.FirstOrDefault(c =>
-                (row.ChannelSpace <= 0 || c.ChannelSpace == row.ChannelSpace)
-                && (row.ChannelIndex <= 0 || c.ChannelIndex == row.ChannelIndex));
-            if (byChannel != null) return byChannel;
-        }
-        return candidates[0];
-    }
-
-    private static string NormalizeServiceKey(string? value)
-        => new string((value ?? string.Empty).Where(c => !char.IsWhiteSpace(c) && c != '　').ToArray()).Trim();
-
     private static ViewerSessionRow FromViewerSession(PluginViewerSessionInfo s)
     {
         var current = ReadBoolCompat(s, "Current", "IsCurrent", "Active", "IsActive");
@@ -1284,9 +1179,6 @@ private string ResolveRequestedViewerProfile(IReadOnlyDictionary<string, string>
     private static string BuildLauncherHtml(FloatingViewerData data, WindowOperation window, string filter, string selectedTuner, string selectedViewerProfile, bool alwaysOnTop)
     {
         var openForm = BuildOpenWindowForm(window, alwaysOnTop, filter, selectedTuner, selectedViewerProfile);
-        var viewerText = data.ViewerSessions.Count == 0
-            ? "視聴中なし"
-            : string.Join(" / ", data.ViewerSessions.Select(x => FirstNonEmpty(x.TunerName, "-") + "-" + FirstNonEmpty(x.Did, "-")));
         return $$"""
 <!doctype html>
 <meta charset="utf-8">
@@ -1328,7 +1220,7 @@ private string ResolveRequestedViewerProfile(IReadOnlyDictionary<string, string>
 <head>
 <meta charset="utf-8">
 <style>
-{{BuildToolWindowCss()}}
+{{BuildToolWindowCss(data.ServiceColumnWidthPx)}}
 </style>
 </head>
 <body>
@@ -1343,7 +1235,7 @@ private string ResolveRequestedViewerProfile(IReadOnlyDictionary<string, string>
 """;
     }
 
-    private static string BuildToolWindowCss()
+    private static string BuildToolWindowCss(int serviceColumnWidthPx)
     {
         var toolbarHeight = ToolWindowToolbarHeightPx;
         var toolbarContentTop = ToolWindowToolbarContentTopPx;
@@ -1365,7 +1257,8 @@ private string ResolveRequestedViewerProfile(IReadOnlyDictionary<string, string>
         var cellHeight = ToolWindowToolbarCellHeightPx;
         var listTop = ToolWindowListTopPx;
         var rowHeight = ToolWindowRowHeightPx;
-        var serviceWidth = ToolWindowServiceColumnWidthPx;
+        var serviceWidth = Math.Max(ToolWindowServiceColumnMinimumWidthPx, Math.Min(ToolWindowServiceColumnMaximumWidthPx, serviceColumnWidthPx));
+        var timeWidth = ToolWindowTimeColumnWidthPx;
         
         return $$"""
 html,body{margin:0;padding:0;width:100%;height:100%;background:#eef4f8;color:#102334;font-family:Meiryo,"Yu Gothic",Arial,sans-serif;font-size:12px;overflow:hidden;}
@@ -1412,7 +1305,7 @@ body{position:static;}
 .aircon-action-topmost-on:hover{background:#bd3838;}
 .aircon-action-topmost.aircon-toolbar-button-disabled{background:#edf0f2;border-color:#c0c8ce;color:#87939b;}
 .aircon-list{position:fixed;left:0;right:0;top:{{listTop}}px;bottom:0;background:#fff;overflow-x:hidden;overflow-y:scroll;width:100%;height:auto;}
-.aircon-row{display:block;width:100%;margin:0;padding:0 8px;border:0;border-bottom:1px solid #d5e2ec;background:#ffffff;cursor:pointer;font-family:inherit;text-align:left;color:#102334;height:{{rowHeight}}px;line-height:{{rowHeight}}px;white-space:nowrap;overflow:hidden;}
+.aircon-row{display:block;position:relative;width:100%;margin:0;padding:0 8px;border:0;border-bottom:1px solid #d5e2ec;background:#ffffff;cursor:pointer;font-family:inherit;text-align:left;color:#102334;height:{{rowHeight}}px;line-height:{{rowHeight}}px;white-space:nowrap;overflow:hidden;}
 .aircon-row-even{background:#f2f8fc;}
 .aircon-row-odd{background:#ffffff;}
 .aircon-row:hover{background:#eaf5fd;}
@@ -1423,11 +1316,12 @@ body{position:static;}
 .aircon-row-viewing-selected:hover{background:#ffe9a2;}
 .aircon-row-viewing-other:hover{background:#dcecf7;}
 .aircon-row span{cursor:inherit;}
-.aircon-viewer-badge{float:left;display:block;width:22px;height:{{rowHeight}}px;line-height:{{rowHeight}}px;margin:0;padding:0;text-align:center;font-size:11px;font-weight:bold;color:#245b80;white-space:nowrap;overflow:hidden;}
-.aircon-viewer-badge-on{color:#fff;background:#245b80;border-radius:2px;height:18px;line-height:18px;margin-top:6px;}
-.aircon-viewer-badge-other{color:#245b80;background:#d5e9f6;border:1px solid #8fb2c9;border-radius:2px;height:18px;line-height:16px;margin-top:6px;}
-.aircon-service{float:left;display:block;width:{{serviceWidth - 22}}px;height:{{rowHeight}}px;line-height:{{rowHeight}}px;vertical-align:top;color:#07344f;font-weight:bold;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-.aircon-current{display:block;width:auto;margin-left:{{serviceWidth}}px;height:{{rowHeight}}px;line-height:{{rowHeight}}px;vertical-align:top;color:#071522;font-size:12px;font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:clip;}
+.aircon-service{position:absolute;left:8px;top:0;display:block;width:{{serviceWidth}}px;height:{{rowHeight}}px;line-height:{{rowHeight}}px;vertical-align:top;color:#07344f;font-weight:bold;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.aircon-time{position:absolute;left:{{8 + serviceWidth}}px;top:0;display:block;width:{{timeWidth}}px;height:{{rowHeight}}px;margin:0;padding:3px 2px 0 0;text-align:center;vertical-align:top;white-space:nowrap;overflow:hidden;font-size:10px;line-height:11px;font-weight:bold;}
+.aircon-time-start,.aircon-time-end{display:block;height:11px;line-height:11px;margin:0;padding:0;white-space:nowrap;overflow:hidden;}
+.aircon-time-start{color:#4f6f9f;}
+.aircon-time-end{color:#9a5a5a;}
+.aircon-current{position:absolute;left:{{8 + serviceWidth + timeWidth}}px;right:8px;top:0;display:block;width:auto;margin:0;height:{{rowHeight}}px;line-height:{{rowHeight}}px;vertical-align:top;color:#071522;font-size:12px;font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:clip;}
 .aircon-scroll-anchor{display:block;width:100%;height:1px;line-height:1px;font-size:0;overflow:hidden;margin:0;padding:0;}
 .aircon-empty{padding:16px;color:#60778a;}
 """;
@@ -1542,7 +1436,7 @@ body{position:static;}
         return string.IsNullOrWhiteSpace(profile.Name) ? profile.Id : profile.Name;
     }
 
-private static IReadOnlyList<WaveFilterRow> CanonicalWaveFilters(IReadOnlyList<WaveFilterRow> source)
+    private static IReadOnlyList<WaveFilterRow> CanonicalWaveFilters(IReadOnlyList<WaveFilterRow> source)
     {
         static string LabelFor(string group) => group.Equals("GR", StringComparison.OrdinalIgnoreCase) ? "地上波" : group.ToUpperInvariant();
         return new[] { "GR", "BS", "CS" }
@@ -1587,6 +1481,7 @@ private static IReadOnlyList<WaveFilterRow> CanonicalWaveFilters(IReadOnlyList<W
         var serviceDataId = hasTriplet ? " data-aircon-service-id=\"" + HtmlAttr(serviceDomId) + "\"" : string.Empty;
         var content =
             $"<span class=\"aircon-service\">{Html(row.ServiceName)}</span>" +
+            BuildCurrentTimeHtml(row) +
             $"<span class=\"{currentClass}\"{currentTitleAttr}>{Html(current)}</span>";
 
         if (!hasTriplet)
@@ -1596,6 +1491,48 @@ private static IReadOnlyList<WaveFilterRow> CanonicalWaveFilters(IReadOnlyList<W
 
         return $"<div{rowId}{serviceDataId} class=\"{cls}\" title=\"{HtmlAttr(title)}\" {attrs}>" + content + "</div>";
     }
+    private static string BuildCurrentTimeHtml(ServiceRow row)
+    {
+        var start = FormatTime(row.CurrentStart);
+        var end = FormatTime(row.CurrentEnd);
+        var title = string.IsNullOrEmpty(start) && string.IsNullOrEmpty(end)
+            ? string.Empty
+            : " title=\"" + HtmlAttr((start.Length > 0 ? start : "--:--") + " - " + (end.Length > 0 ? end : "--:--")) + "\"";
+        return "<span class=\"aircon-time\"" + title + ">"
+            + "<span class=\"aircon-time-start\">" + Html(start) + "</span>"
+            + "<span class=\"aircon-time-end\">" + Html(end) + "</span>"
+            + "</span>";
+    }
+
+    private static string FormatTime(DateTimeOffset? value)
+        => value.HasValue ? value.Value.ToLocalTime().ToString("HH:mm", System.Globalization.CultureInfo.InvariantCulture) : string.Empty;
+
+    private static int CalculateServiceColumnWidth(IReadOnlyList<ServiceRow> services)
+    {
+        var maxTextWidth = 0;
+        foreach (var service in services)
+        {
+            var name = service.ServiceName ?? string.Empty;
+            maxTextWidth = Math.Max(maxTextWidth, EstimateServiceNameWidthPx(name));
+        }
+
+        var width = maxTextWidth + ToolWindowServiceColumnHorizontalReservePx;
+        return Math.Max(ToolWindowServiceColumnMinimumWidthPx, Math.Min(ToolWindowServiceColumnMaximumWidthPx, width));
+    }
+
+    private static int EstimateServiceNameWidthPx(string text)
+    {
+        var width = 0;
+        foreach (var ch in text)
+        {
+            width += IsNarrowDisplayChar(ch) ? 7 : 12;
+        }
+        return width;
+    }
+
+    private static bool IsNarrowDisplayChar(char ch)
+        => (ch >= '\u0020' && ch <= '\u007e') || (ch >= '\uff61' && ch <= '\uff9f');
+
     private static string BuildServiceDomId(ServiceRow row)
         => "svc-" + row.NetworkId.ToString(System.Globalization.CultureInfo.InvariantCulture)
             + "-" + row.TransportStreamId.ToString(System.Globalization.CultureInfo.InvariantCulture)
@@ -1616,7 +1553,7 @@ private static IReadOnlyList<WaveFilterRow> CanonicalWaveFilters(IReadOnlyList<W
             + "&focusSid=" + row.ServiceId.ToString(System.Globalization.CultureInfo.InvariantCulture);
     }
 
-private static string BuildFloatingViewerActionAttributes(ServiceRow row, ViewerOperation action, WindowOperation window, TunerChoice selectedTuner, ViewerProfileChoice selectedViewerProfile)
+    private static string BuildFloatingViewerActionAttributes(ServiceRow row, ViewerOperation action, WindowOperation window, TunerChoice selectedTuner, ViewerProfileChoice selectedViewerProfile)
     {
         if (!action.CanPost || string.IsNullOrWhiteSpace(window.WindowId) || !HasResolvedTriplet(row)) return string.Empty;
         var payload = BuildViewerStartPayload(row, selectedTuner, selectedViewerProfile);
@@ -1807,7 +1744,7 @@ private static string BuildFloatingViewerActionAttributes(ServiceRow row, Viewer
             "<button class=\"aircon-open\" type=\"submit\">AIrCon</button></form>";
     }
 
-private static Dictionary<string, string?> WindowOpenFields(WindowOperation window, bool alwaysOnTop, string filter, string selectedTuner, string selectedViewerProfile)
+    private static Dictionary<string, string?> WindowOpenFields(WindowOperation window, bool alwaysOnTop, string filter, string selectedTuner, string selectedViewerProfile)
     {
         return new Dictionary<string, string?>
         {
@@ -1924,7 +1861,7 @@ private static Dictionary<string, string?> WindowOpenFields(WindowOperation wind
     private static TunerChoice ResolveSelectedTuner(IReadOnlyList<TunerChoice> choices, string value)
         => choices.FirstOrDefault(x => x.Value.Equals(value, StringComparison.OrdinalIgnoreCase)) ?? TunerChoice.Auto;
 
-private static string NormalizeFilter(string? value)
+    private static string NormalizeFilter(string? value)
     {
         var v = (value ?? string.Empty).Trim().ToUpperInvariant();
         return v switch
@@ -1957,7 +1894,7 @@ private static string NormalizeFilter(string? value)
         }
     }
 
-private static string ServiceKey(int nid, int tsid, int sid) => nid + ":" + tsid + ":" + sid;
+    private static string ServiceKey(int nid, int tsid, int sid) => nid + ":" + tsid + ":" + sid;
 
     private static bool IsToolWindow(PluginUiContext c)
     {
@@ -2106,7 +2043,7 @@ private static string ServiceKey(int nid, int tsid, int sid) => nid + ":" + tsid
     }
 
     private sealed record ViewerStartPayload(string NetworkId, string TransportStreamId, string ServiceId, string ChannelSpace, string ChannelIndex, string ChannelArgument, string ProgramGuideFilterGroup, string BroadcastGroup, string AllocationGroup, string TunerGroup, string ServiceName, string PreferredTunerName, string PreferredDid, string PreferredSlot, string ViewerProfile, string ViewerProfileName);
-    private sealed record FloatingViewerData(IReadOnlyList<ServiceRow> Services, IReadOnlyList<ViewerSessionRow> ViewerSessions, IReadOnlyList<ViewerTunerRow> ViewerTuners, IReadOnlyList<WaveFilterRow> WaveFilters, ViewerProfileState ViewerProfiles, IReadOnlyList<string> Diagnostics, bool ProjectionUsed, bool SafeEventContractAvailable, bool SafeDblclickEvents);
+    private sealed record FloatingViewerData(IReadOnlyList<ServiceRow> Services, IReadOnlyList<ViewerSessionRow> ViewerSessions, IReadOnlyList<ViewerTunerRow> ViewerTuners, IReadOnlyList<WaveFilterRow> WaveFilters, ViewerProfileState ViewerProfiles, IReadOnlyList<string> Diagnostics, bool ProjectionUsed, bool SafeEventContractAvailable, bool SafeDblclickEvents, int ServiceColumnWidthPx);
     private sealed record ViewerOperation(bool CanPost, string ActionEndpoint, string ActionRoute, string ActionMethod, string ActionToken, string PluginId, string RouteSegment);
     private sealed record WindowOperation(bool CanOpen, bool CanSelfRefresh, string WindowEndpoint, string WindowRoute, string WindowMethod, string WindowToken, string PluginId, string RouteSegment, string WindowId, string WindowStateEndpoint, bool ToolWindowSupported);
     private sealed record ViewerSessionRow(string LeaseId, string ServiceName, string ProgramGuideFilterGroup, string AllocationGroup, string TunerGroup, string TunerName, string Did, int SlotIndex, ushort? NetworkId, ushort? TransportStreamId, ushort? ServiceId, bool Current, string ViewerState, string ViewerProfile, string ViewerProfileName, string TvTestPathKey)
@@ -2155,14 +2092,8 @@ private static string ServiceKey(int nid, int tsid, int sid) => nid + ":" + tsid
         public string CurrentTitle { get; set; } = string.Empty;
         public DateTimeOffset? CurrentStart { get; set; }
         public DateTimeOffset? CurrentEnd { get; set; }
-        public string NextTitle { get; set; } = string.Empty;
-        public DateTimeOffset? NextStart { get; set; }
-        public DateTimeOffset? NextEnd { get; set; }
+        public bool HasCurrentProgramProjection { get; set; }
         public bool IsViewing { get; set; }
-        public string ViewingLeaseId { get; set; } = string.Empty;
-        public string ViewingTunerName { get; set; } = string.Empty;
-        public string ViewingDid { get; set; } = string.Empty;
         public string ViewingViewerProfile { get; set; } = string.Empty;
-        public string ViewingViewerProfileName { get; set; } = string.Empty;
     }
 }

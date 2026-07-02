@@ -1,4 +1,4 @@
-AIrCon v1.0.1
+AIrCon v1.0.2
 ==============================
 
 TvAIr 用の視聴操作プラグインです。
@@ -8,6 +8,7 @@ TvAIr 用の視聴操作プラグインです。
 ------------------------------
 
 README.txt
+RELEASE_NOTES.txt
 AIrCon.BasicPlugin.sln
 AIrCon.BasicPlugin.plugin.json
 .gitignore
@@ -87,4 +88,4 @@ TvAIr\Plugins\AIrCon.ico
 バージョン
 ------------------------------
 
-AIrCon v1.0.1
+AIrCon v1.0.2

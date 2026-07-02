@@ -7,9 +7,10 @@
     <Platforms>AnyCPU;x64</Platforms>
     <RootNamespace>AIrCon.BasicPlugin</RootNamespace>
     <AssemblyName>AIrCon.BasicPlugin</AssemblyName>
-    <Version>1.0.1</Version>
-    <FileVersion>1.0.1.0</FileVersion>
-    <AssemblyVersion>1.0.1.0</AssemblyVersion>
+    <Version>1.0.2</Version>
+    <FileVersion>1.0.2.0</FileVersion>
+    <AssemblyVersion>1.0.2.0</AssemblyVersion>
+    <InformationalVersion>1.0.2</InformationalVersion>
     <OutputType>Library</OutputType>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
   </PropertyGroup>
@@ -22,7 +23,4 @@
   <ItemGroup>
     <ProjectReference Include="..\TvAIrPlugin\TvAIrPlugin.csproj" Private="false" />
   </ItemGroup>
-  <Target Name="EnsureRestoreAssets" BeforeTargets="PrepareForBuild" Condition="!Exists('$(ProjectAssetsFile)')">
-    <MSBuild Projects="$(MSBuildProjectFullPath)" Targets="Restore" Properties="Configuration=$(Configuration);Platform=$(Platform)" />
-  </Target>
 </Project>

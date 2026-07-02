@@ -11,3 +11,4 @@ obj/
 *.rej
 *.patch
 *.zip
+TvAIrPlugin/TvAIrPluginSdkContract.generated.cs

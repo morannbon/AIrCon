@@ -1,7 +1,7 @@
 {
   "id": "aircon.basic",
   "name": "AIrCon",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "route": "aircon",
   "kind": [
     "Viewer",
@@ -51,7 +51,7 @@
     "mode": "toolWindow",
     "route": "aircon",
     "menuText": "AIrCon",
-    "toolWindowTitle": "AIrCon v1.0.1"
+    "toolWindowTitle": "AIrCon v1.0.2"
   },
   "menu": {
     "defaultMenuActionKind": "toolWindow",
@@ -66,7 +66,7 @@
     "reuseExisting": true,
     "activateExisting": true,
     "showInTaskbar": true,
-    "title": "AIrCon v1.0.1"
+    "title": "AIrCon v1.0.2"
   },
   "actions": [
     "viewerStart",
