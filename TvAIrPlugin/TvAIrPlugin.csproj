@@ -8,10 +8,11 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>TvAIrPlugin</RootNamespace>
     <AssemblyName>TvAIrPlugin</AssemblyName>
-    <Version>1.0.0</Version>
-    <FileVersion>1.0.0.0</FileVersion>
-    <AssemblyVersion>1.0.0.0</AssemblyVersion>
-    <InformationalVersion>1.0.0</InformationalVersion>
+    <Version>$(TvAIrPluginSdkVersion)</Version>
+    <FileVersion>$(TvAIrFileVersion)</FileVersion>
+    <AssemblyVersion>$(TvAIrPluginSdkAssemblyVersion)</AssemblyVersion>
+    <InformationalVersion>$(TvAIrPluginSdkVersion)</InformationalVersion>
+    <!-- TvAIr 1.0.0 を Plugin SDK の互換開始点とする。 -->
     <OutputType>Library</OutputType>
   </PropertyGroup>
 
@@ -22,10 +23,5 @@
   <PropertyGroup Condition="'$(Platform)'=='x64'">
     <PlatformTarget>x64</PlatformTarget>
   </PropertyGroup>
-
-
-  <ItemGroup>
-    <Compile Remove="TvAIrPluginSdkContract.generated.cs" />
-  </ItemGroup>
 
 </Project>
