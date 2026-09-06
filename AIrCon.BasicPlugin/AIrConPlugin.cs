@@ -7,12 +7,12 @@ using TvAIrPlugin.Viewers;
 namespace AIrCon.BasicPlugin;
 
 /// <summary>
-/// AIrCon 正式リリース版。
-/// ToolWindow内の行ダブルクリック視聴を主導線にする。
+/// AIrCon 視聴操作Plugin。
+/// ToolWindow内の行ダブルクリック視聴と右クリック視聴予約を主導線にする。
 /// </summary>
 internal sealed class AIrConRenderer
 {
-    internal const string PluginVersion = "1.0.3";
+    internal const string PluginVersion = "1.0.4";
     internal const string PluginListTitle = "AIrCon";
     internal static string PluginToolWindowTitle => $"{PluginListTitle} {PluginVersion}";
     internal const string PluginId = "aircon.basic";
@@ -33,6 +33,7 @@ internal sealed class AIrConRenderer
     private const string AirConActionPowerOffStop = "powerOffStop";
     private const string AirConActionViewerPowerOff = "viewerPowerOff";
     private const string AirConActionViewerTune = "viewerTune";
+    private const string AirConActionViewerReservationToggle = "viewerReservationToggle";
     private const string AirConActionViewerActivate = "viewerActivate";
     private const string AirConActionSettingsOpen = "settingsOpen";
     private const string AirConActionSettingsSave = "settingsSave";
@@ -104,6 +105,9 @@ internal sealed class AIrConRenderer
         var lifecycle = TryReadRuntimeWindowLifecycle(eventEnvelope.Payload);
         if (lifecycle == null)
         {
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog("WINDOW_LIFECYCLE result=SKIPPED reason=payload_missing_or_invalid");
+            #endif
             return;
         }
 
@@ -117,6 +121,9 @@ internal sealed class AIrConRenderer
             return;
 
         StopWindowBackgroundExecution(lifecycle.WindowInstanceId);
+        #if AIRCON_DEVELOPER_DIAGNOSTICS
+        SafeLog($"WINDOW_LIFECYCLE result=TERMINAL state={lifecycle.State} windowId={lifecycle.WindowInstanceId} source={lifecycle.Source} sessionDisposed={lifecycle.SessionDisposed} action=stop_window_background_execution");
+        #endif
     }
 
     private static TvAirRuntimeWindowLifecycleDto? TryReadRuntimeWindowLifecycle(object? payload)
@@ -188,11 +195,17 @@ internal sealed class AIrConRenderer
                     var saved = AIrConNewApiBridge.SaveSettings(remember, interval, startupWave);
                     if (!saved.Success)
                     {
+                        #if AIRCON_DEVELOPER_DIAGNOSTICS
+                        SafeLog($"SETTINGS_SAVE result=FAILED diagnostics={saved.Diagnostics}");
+                        #endif
                         return new RuntimeUiActionResult { Succeeded = false, Message = "設定保存失敗", Diagnostics = saved.Diagnostics };
                     }
                     var placement = AIrConNewApiBridge.SetPlacementPersistence("main", remember);
                     if (!placement.Success)
                     {
+                        #if AIRCON_DEVELOPER_DIAGNOSTICS
+                        SafeLog($"SETTINGS_SAVE result=FAILED phase=placement diagnostics={placement.Diagnostics}");
+                        #endif
                         return new RuntimeUiActionResult { Succeeded = false, Message = "位置記憶設定失敗", Diagnostics = placement.Diagnostics };
                     }
                     var verifiedSettings = AIrConNewApiBridge.LoadSettings();
@@ -200,10 +213,19 @@ internal sealed class AIrConRenderer
                         verifiedSettings.ZappingIntervalSeconds != interval ||
                         !string.Equals(verifiedSettings.StartupWave, startupWave, StringComparison.OrdinalIgnoreCase))
                     {
+                        #if AIRCON_DEVELOPER_DIAGNOSTICS
+                        SafeLog($"SETTINGS_SAVE_VERIFY result=FAILED writtenRemember={remember} readBackRemember={verifiedSettings.RememberWindowPlacement} writtenInterval={interval} readBackInterval={verifiedSettings.ZappingIntervalSeconds} writtenWave={startupWave} readBackWave={verifiedSettings.StartupWave}");
+                        #endif
                         return new RuntimeUiActionResult { Succeeded = false, Message = "設定保存確認失敗", Diagnostics = "settings_readback_mismatch" };
                     }
+                    #if AIRCON_DEVELOPER_DIAGNOSTICS
+                    SafeLog($"SETTINGS_SAVE_VERIFY result=OK writtenRemember={remember} readBackRemember={verifiedSettings.RememberWindowPlacement} writtenInterval={interval} readBackInterval={verifiedSettings.ZappingIntervalSeconds} writtenWave={startupWave} readBackWave={verifiedSettings.StartupWave}");
+                    #endif
                     var route = "/plugin/aircon?wave=" + Url(returnWave) + (string.IsNullOrWhiteSpace(returnProfile) ? string.Empty : "&viewerProfile=" + Url(returnProfile));
                     var refresh = AIrConNewApiBridge.RefreshToolWindow(settingsWindowId, route);
+                    #if AIRCON_DEVELOPER_DIAGNOSTICS
+                    SafeLog($"SETTINGS_SAVE result={(refresh.Success ? "OK" : "FAILED")} rememberPlacement={remember} zappingIntervalSeconds={interval} startupWave={startupWave} refresh={refresh.Diagnostics}");
+                    #endif
                     return new RuntimeUiActionResult { Succeeded = refresh.Success, Message = refresh.Success ? "設定を保存" : "設定画面更新失敗", Diagnostics = refresh.Diagnostics };
                 }
 
@@ -212,6 +234,9 @@ internal sealed class AIrConRenderer
                     ? "/plugin/aircon?view=settings&" + returnQuery
                     : "/plugin/aircon?wave=" + Url(returnWave) + (string.IsNullOrWhiteSpace(returnProfile) ? string.Empty : "&viewerProfile=" + Url(returnProfile));
                 var settingsRefresh = AIrConNewApiBridge.RefreshToolWindow(settingsWindowId, targetRoute);
+                #if AIRCON_DEVELOPER_DIAGNOSTICS
+                SafeLog($"SETTINGS_VIEW action={airconAction} result={(settingsRefresh.Success ? "OK" : "FAILED")} diagnostics={settingsRefresh.Diagnostics}");
+                #endif
                 return new RuntimeUiActionResult { Succeeded = settingsRefresh.Success, Message = settingsRefresh.Success ? "OK" : "設定画面更新失敗", Diagnostics = settingsRefresh.Diagnostics };
             }
 
@@ -222,13 +247,17 @@ internal sealed class AIrConRenderer
                 airconAction.Equals(AirConActionPowerOffStop, StringComparison.OrdinalIgnoreCase) ||
                 airconAction.Equals(AirConActionViewerPowerOff, StringComparison.OrdinalIgnoreCase) ||
                 airconAction.Equals(AirConActionViewerActivate, StringComparison.OrdinalIgnoreCase) ||
-                airconAction.Equals(AirConActionViewerTune, StringComparison.OrdinalIgnoreCase))
+                airconAction.Equals(AirConActionViewerTune, StringComparison.OrdinalIgnoreCase) ||
+                airconAction.Equals(AirConActionViewerReservationToggle, StringComparison.OrdinalIgnoreCase))
             {
                 var windowId = FirstNonEmpty(request.CurrentWindowId, PayloadValue(request, "windowId", "window-id", "currentWindowId", "current-window-id"));
                 var wave = NormalizeWaveFilter(PayloadValue(request, "wave", "currentWave", "current-wave"));
                 var viewerProfile = NormalizeViewerProfileId(PayloadValue(request, "viewerProfile", "viewer-profile"));
                 if (string.IsNullOrWhiteSpace(viewerProfile))
                 {
+                    #if AIRCON_DEVELOPER_DIAGNOSTICS
+                    SafeLog($"VIEWER_OPERATION rejected action={airconAction} reason=viewer_profile_missing");
+                    #endif
                     return new RuntimeUiActionResult { Succeeded = false, Message = "視聴先を選択してください。", Diagnostics = "viewer_profile_missing" };
                 }
 
@@ -247,6 +276,9 @@ internal sealed class AIrConRenderer
                     if (liveSession == null)
                     {
                         var refreshOnly = AIrConNewApiBridge.RefreshToolWindow(windowId, contentRoute);
+                        #if AIRCON_DEVELOPER_DIAGNOSTICS
+                        SafeLog($"VIEWER_MANUAL_ACTIVATE viewerProfile={viewerProfile} wave={wave} result=SKIPPED reason=viewer_not_running selectionApplied=True refreshResult={(refreshOnly.Success ? "OK" : "FAILED")} refreshDiagnostics={refreshOnly.Diagnostics}");
+                        #endif
                         return new RuntimeUiActionResult { Succeeded = refreshOnly.Success, Message = "視聴先を選択", Diagnostics = refreshOnly.Success ? "viewer_not_running_selection_applied_and_refreshed" : refreshOnly.Diagnostics };
                     }
 
@@ -254,11 +286,58 @@ internal sealed class AIrConRenderer
                     var refresh = AIrConNewApiBridge.RefreshToolWindow(windowId, contentRoute);
                     var recoveredNotRunning = activated.Success && activated.Diagnostics.Equals("viewer_process_exited_recovered", StringComparison.OrdinalIgnoreCase);
                     var success = activated.Success && refresh.Success;
+                    #if AIRCON_DEVELOPER_DIAGNOSTICS
+                    SafeLog($"VIEWER_MANUAL_ACTIVATE viewerProfile={viewerProfile} wave={wave} session={liveSession.ViewerSessionId} pid={liveSession.ProcessId} result={(recoveredNotRunning ? "SKIPPED" : activated.Success ? "OK" : "FAILED")}"
+                        + (recoveredNotRunning ? " reason=viewer_process_exited_recovered selectionApplied=True" : string.Empty)
+                        + $" diagnostics={activated.Diagnostics} refreshResult={(refresh.Success ? "OK" : "FAILED")} refreshDiagnostics={refresh.Diagnostics}");
+                    #endif
                     return new RuntimeUiActionResult
                     {
                         Succeeded = success,
                         Message = recoveredNotRunning && success ? "視聴先を選択" : success ? "TVTestを前面化" : (!activated.Success ? activated.Message : "AIrCon画面更新失敗"),
                         Diagnostics = recoveredNotRunning && success ? "viewer_not_running_selection_applied_and_refreshed" : !activated.Success ? activated.Diagnostics : refresh.Diagnostics
+                    };
+                }
+
+                if (airconAction.Equals(AirConActionViewerReservationToggle, StringComparison.OrdinalIgnoreCase))
+                {
+                    var reservationId = PayloadValue(request, "reservationId", "reservation-id");
+                    AIrConNewApiBridge.OperationResult reservationResult;
+                    if (!string.IsNullOrWhiteSpace(reservationId))
+                    {
+                        reservationResult = await AIrConNewApiBridge.CancelViewerReservationAsync(reservationId).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        var nidText = PayloadValue(request, "networkId", "network-id", "nid");
+                        var tsidText = PayloadValue(request, "transportStreamId", "transport-stream-id", "tsid");
+                        var sidText = PayloadValue(request, "serviceId", "service-id", "sid");
+                        var eventIdText = PayloadValue(request, "eventId", "event-id", "eid");
+                        var startText = PayloadValue(request, "scheduledStart", "scheduled-start");
+                        var endText = PayloadValue(request, "scheduledEnd", "scheduled-end");
+                        if (!ushort.TryParse(nidText, out var nid) || !ushort.TryParse(tsidText, out var tsid) ||
+                            !ushort.TryParse(sidText, out var sid) || !ushort.TryParse(eventIdText, out var eventId) ||
+                            !DateTimeOffset.TryParse(startText, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.RoundtripKind, out var scheduledStart) ||
+                            !DateTimeOffset.TryParse(endText, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.RoundtripKind, out var scheduledEnd))
+                            return new RuntimeUiActionResult { Succeeded = false, Message = "視聴予約を登録できません。", Diagnostics = "viewer_reservation_payload_invalid" };
+
+                        reservationResult = await AIrConNewApiBridge.CreateViewerReservationAsync(viewerProfile, nid, tsid, sid, eventId, scheduledStart, scheduledEnd).ConfigureAwait(false);
+                    }
+
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+                    SafeLog($"VIEWER_RESERVATION_TOGGLE viewerProfile={viewerProfile} reservation={(string.IsNullOrWhiteSpace(reservationId) ? "new" : reservationId)} result={(reservationResult.Success ? "OK" : "FAILED")} diagnostics={reservationResult.Diagnostics}");
+#endif
+                    var returnViewerProfile = NormalizeViewerProfileId(PayloadValue(request, "returnViewerProfile", "return-viewer-profile"));
+                    if (string.IsNullOrWhiteSpace(returnViewerProfile)) returnViewerProfile = viewerProfile;
+                    return new RuntimeUiActionResult
+                    {
+                        Succeeded = reservationResult.Success,
+                        Message = reservationResult.Success ? "OK" : reservationResult.Message,
+                        Diagnostics = reservationResult.Diagnostics,
+                        RefreshRequested = reservationResult.Success,
+                        RefreshTarget = "content",
+                        PreserveScroll = true,
+                        ContentRoute = "/plugin/aircon?wave=" + Url(wave) + "&viewerProfile=" + Url(returnViewerProfile)
                     };
                 }
 
@@ -285,6 +364,9 @@ internal sealed class AIrConRenderer
                 if (airconAction.Equals(AirConActionZappingStop, StringComparison.OrdinalIgnoreCase))
                 {
                     await StopZappingAsync(viewerProfile).ConfigureAwait(false);
+                    #if AIRCON_DEVELOPER_DIAGNOSTICS
+                    SafeLog($"ZAPPING_STATE stopped windowId={windowId} wave={wave} viewerProfile={viewerProfile}");
+                    #endif
                     return new RuntimeUiActionResult
                     {
                         Succeeded = true,
@@ -301,8 +383,14 @@ internal sealed class AIrConRenderer
                     {
                         if (!existing.Wave.Equals(wave, StringComparison.OrdinalIgnoreCase))
                         {
+                            #if AIRCON_DEVELOPER_DIAGNOSTICS
+                            SafeLog($"ZAPPING_STATE blocked viewerProfile={viewerProfile} activeWave={existing.Wave} requestedWave={wave} reason=viewer_profile_locked_by_active_zapping");
+                            #endif
                             return new RuntimeUiActionResult { Succeeded = false, Message = $"巡回中（{existing.Wave}）", Diagnostics = "viewer_profile_locked_by_active_zapping" };
                         }
+                        #if AIRCON_DEVELOPER_DIAGNOSTICS
+                        SafeLog($"ZAPPING_STATE already_active windowId={windowId} wave={existing.Wave} viewerProfile={viewerProfile} generation={existing.Generation}");
+                        #endif
                         return new RuntimeUiActionResult
                         {
                             Succeeded = true,
@@ -318,6 +406,9 @@ internal sealed class AIrConRenderer
                         x.ProcessId is > 0);
                     if (liveSession is null)
                     {
+                        #if AIRCON_DEVELOPER_DIAGNOSTICS
+                        SafeLog($"ZAPPING_STATE skipped windowId={windowId} wave={wave} viewerProfile={viewerProfile} reason=viewer_not_running");
+                        #endif
                         return new RuntimeUiActionResult
                         {
                             Succeeded = true,
@@ -328,6 +419,9 @@ internal sealed class AIrConRenderer
                     }
 
                     var started = EnsureZappingActive(windowId, wave, viewerProfile);
+                    #if AIRCON_DEVELOPER_DIAGNOSTICS
+                    SafeLog($"ZAPPING_STATE started windowId={windowId} wave={started.Wave} viewerProfile={viewerProfile} generation={started.Generation} intervalSeconds={started.IntervalSeconds}");
+                    #endif
 
                     // 開始時は現在局を維持し、最初の選局は設定された間隔後のserver_timerだけが行う。
                     // 開始操作からRunZappingTickAsyncを直接呼ばない。
@@ -344,12 +438,18 @@ internal sealed class AIrConRenderer
                 {
                     var stopResult = await CompleteShutdownAsync(viewerProfile, windowId, "toolbar_power").ConfigureAwait(false);
                     var stopped = stopResult.Success;
+                    #if AIRCON_DEVELOPER_DIAGNOSTICS
+                    SafeLog($"VIEWER_POWER_OFF viewerProfile={viewerProfile} result={(stopped ? "OK" : "FAILED")} message={stopResult.Message}");
+                    #endif
                     return new RuntimeUiActionResult { Succeeded = stopped, Message = stopped ? "視聴停止" : "視聴停止失敗", Diagnostics = stopped ? "viewer_power_off_ok" : "viewer_power_off_failed" };
                 }
 
                 if (airconAction.Equals(AirConActionPowerOffStop, StringComparison.OrdinalIgnoreCase))
                 {
                     SetPowerOffStopped(viewerProfile);
+                    #if AIRCON_DEVELOPER_DIAGNOSTICS
+                    SafeLog($"POWER_OFF_TIMER stopped viewerProfile={viewerProfile}");
+                    #endif
                     return new RuntimeUiActionResult
                     {
                         Succeeded = true,
@@ -364,6 +464,9 @@ internal sealed class AIrConRenderer
                     var hoursText = PayloadValue(request, "hours", "powerOffHours", "power-off-hours");
                     if (!int.TryParse(hoursText, out var hours) || hours < 1 || hours > 6) hours = 1;
                     StartPowerOff(viewerProfile, hours, windowId);
+                    #if AIRCON_DEVELOPER_DIAGNOSTICS
+                    SafeLog($"POWER_OFF_TIMER started viewerProfile={viewerProfile} hours={hours}");
+                    #endif
                     return new RuntimeUiActionResult
                     {
                         Succeeded = true,
@@ -377,10 +480,16 @@ internal sealed class AIrConRenderer
                 return new RuntimeUiActionResult { Succeeded = tick.Success, Message = tick.Success ? "ザッピング中" : "ザッピング停止", Diagnostics = tick.Diagnostics };
             }
 
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog($"PLUGIN_ACTION ignored action={request.ActionName} airconAction={airconAction}");
+            #endif
             return new RuntimeUiActionResult { Succeeded = true, Message = "OK", Diagnostics = "ignored" };
         }
         catch (Exception ex)
         {
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog("PLUGIN_ACTION failed: " + ex.GetType().Name + " " + ex.Message);
+            #endif
             return new RuntimeUiActionResult { Succeeded = false, Message = "失敗", Diagnostics = ex.GetType().Name };
         }
     }
@@ -489,13 +598,25 @@ internal sealed class AIrConRenderer
             if (zappingActive && activeZappingWave.Equals(filter, StringComparison.OrdinalIgnoreCase)) UpdateZappingWindowSubscription(selectedViewerProfile.Value, windowIdForWave, filter);
             var powerOffDeadline = ResolvePowerOffDeadline(selectedViewerProfile.Value);
             var data = CaptureData(filter, viewerProfiles, focusTriplet);
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog($"RenderHtml route=aircon mode=viewer_1_0_4 toolWindow={isToolWindow} requestedWave={requestedWave} effectiveWave={filter} viewerProfile={selectedViewerProfile.Value} selectorVisible={viewerProfiles.SelectorVisibleRecommended} profiles={viewerProfiles.SelectableProfiles.Count} services={data.Services.Count} viewers={data.ViewerSessions.Count} activeViewers={data.ViewerSessions.Count(x => x.IsActive)} highlighted={data.Services.Count(x => x.IsViewing)} projectionUsed={data.ProjectionUsed}");
+            #endif
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            if (zappingActive) SafeLog($"ZAPPING_STATE active windowId={windowIdForWave} activeWave={activeZappingWave} displayedWave={filter} viewerProfile={selectedViewerProfile.Value} services={data.Services.Count} intervalSeconds={activeZappingState!.IntervalSeconds}");
+            #endif
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            else if (QueryString(query, "zapping").Equals("off", StringComparison.OrdinalIgnoreCase)) SafeLog($"ZAPPING_STATE stopped windowId={windowIdForWave} wave={filter} viewerProfile={selectedViewerProfile.Value}");
+            #endif
 
             return isToolWindow
                 ? BuildFloatingViewerHtml(context, data, action, window, filter, selectedTunerValue, selectedViewerProfile, alwaysOnTop, zappingActive, activeZappingWave, powerOffDeadline)
                 : BuildLauncherHtml(context, data, window, filter, selectedTunerValue, selectedViewerProfile.Value, alwaysOnTop);
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog("RenderHtml failed: " + ex.GetType().Name + " " + ex.Message);
+            #endif
             return BuildRenderFailureHtml(context);
         }
     }
@@ -647,6 +768,9 @@ internal sealed class AIrConRenderer
                     (expectedGeneration.HasValue && state.Generation != expectedGeneration.Value) ||
                     state.Generation != CurrentOperationGeneration(viewerProfile))
                 {
+                    #if AIRCON_DEVELOPER_DIAGNOSTICS
+                    SafeLog($"ZAPPING_TICK skipped reason=inactive_or_superseded viewerProfile={viewerProfile} source={source}");
+                    #endif
                     return new ZappingTickResult(false, "zapping_inactive_or_superseded");
                 }
             }
@@ -663,14 +787,23 @@ internal sealed class AIrConRenderer
             if (!string.IsNullOrWhiteSpace(windowId) && IsWindowDisplaying(windowId, wave, viewerProfile))
             {
                 var ownerRefresh = AIrConNewApiBridge.RefreshToolWindow(windowId, null);
+                #if AIRCON_DEVELOPER_DIAGNOSTICS
+                SafeLog($"ZAPPING_WINDOW_REFRESH result={(ownerRefresh.Success ? "OK" : "FAILED")} mode=owner_preflight windowId={windowId} wave={wave} viewerProfile={viewerProfile} refreshIssued=True diagnostics={ownerRefresh.Diagnostics}");
+                #endif
                 if (!ownerRefresh.Success && IsDefinitiveWindowGone(ownerRefresh.Diagnostics))
                 {
                     StopWindowBackgroundExecution(windowId);
+                    #if AIRCON_DEVELOPER_DIAGNOSTICS
+                    SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=refresh_target_not_found_before_dispatch windowId={windowId} diagnostics={ownerRefresh.Diagnostics} backgroundExecution=StopWithWindow");
+                    #endif
                     return new ZappingTickResult(false, "zapping_window_closed");
                 }
             }
             else if (!string.IsNullOrWhiteSpace(windowId))
             {
+                #if AIRCON_DEVELOPER_DIAGNOSTICS
+                SafeLog($"ZAPPING_WINDOW_REFRESH result=SKIPPED mode=owner_preflight reason=event_profile_not_displayed windowId={windowId} wave={wave} viewerProfile={viewerProfile} refreshIssued=False action=viewer_state_only");
+                #endif
             }
 
             var services = CaptureServiceProjection(wave)
@@ -679,7 +812,13 @@ internal sealed class AIrConRenderer
                 .ToList();
             if (services.Count == 0)
             {
+                #if AIRCON_DEVELOPER_DIAGNOSTICS
+                SafeLog($"ZAPPING_TICK failed reason=no_services windowId={windowId} wave={wave} viewerProfile={viewerProfile} source={source}");
+                #endif
                 RemoveZappingState(viewerProfile);
+                #if AIRCON_DEVELOPER_DIAGNOSTICS
+                SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=no_services");
+                #endif
                 return new ZappingTickResult(false, "zapping_no_services");
             }
 
@@ -699,6 +838,9 @@ internal sealed class AIrConRenderer
             // Stop/shutdown may have superseded this tick while channel data was being captured.
             if (!IsCurrentZappingGeneration(viewerProfile, state.Generation))
             {
+                #if AIRCON_DEVELOPER_DIAGNOSTICS
+                SafeLog($"ZAPPING_TICK skipped reason=superseded_before_dispatch viewerProfile={viewerProfile} generation={state.Generation} source={source}");
+                #endif
                 return new ZappingTickResult(false, "zapping_superseded");
             }
 
@@ -706,6 +848,9 @@ internal sealed class AIrConRenderer
             if (liveSession is null || !liveSession.ViewerProfileId.Equals(viewerProfile, StringComparison.Ordinal) || liveSession.ProcessId != state.ProcessId || liveSession.Generation != state.ViewerGeneration)
             {
                 RemoveZappingState(viewerProfile);
+                #if AIRCON_DEVELOPER_DIAGNOSTICS
+                SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=viewer_identity_changed expectedSession={state.ViewerSessionId} expectedGeneration={state.ViewerGeneration} expectedPid={state.ProcessId}");
+                #endif
                 return new ZappingTickResult(false, "zapping_viewer_identity_changed");
             }
             var result = await SwitchViewerServiceCoreAsync(
@@ -727,6 +872,9 @@ internal sealed class AIrConRenderer
                 if (replacement == null || string.IsNullOrWhiteSpace(replacement.ViewerSessionId) || replacement.ProcessId.GetValueOrDefault() <= 0)
                 {
                     RemoveZappingState(viewerProfile);
+                    #if AIRCON_DEVELOPER_DIAGNOSTICS
+                    SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=replacement_identity_missing");
+                    #endif
                     return new ZappingTickResult(false, "zapping_replacement_identity_missing");
                 }
                 var replacementProcessId = replacement.ProcessId.GetValueOrDefault();
@@ -735,8 +883,14 @@ internal sealed class AIrConRenderer
             else
             {
                 RemoveZappingState(viewerProfile);
+                #if AIRCON_DEVELOPER_DIAGNOSTICS
+                SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=switch_failed diagnostics={result.Diagnostics}");
+                #endif
             }
 
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog($"ZAPPING_TICK result={(mayContinue ? (result.HasWarning ? "WARNING" : "OK") : "FAILED")} source={source} windowId={windowId} wave={wave} viewerProfile={viewerProfile} generation={state.Generation} index={nextIndex + 1}/{services.Count} service={target.ServiceName} nid={target.NetworkId} tsid={target.TransportStreamId} sid={target.ServiceId} authoritativeService={serviceKey} operationCompleted={result.OperationCompleted} hasWarning={result.HasWarning} continuationRecommended={result.ContinuationRecommended} message={result.Message}");
+            #endif
             if (mayContinue)
             {
                 // Keep the visible zapping wave current without activating or revealing AIrCon.
@@ -746,21 +900,36 @@ internal sealed class AIrConRenderer
                 if (IsWindowDisplaying(windowId, wave, viewerProfile))
                 {
                     var refresh = AIrConNewApiBridge.RefreshToolWindow(windowId, null);
+                    #if AIRCON_DEVELOPER_DIAGNOSTICS
+                    SafeLog($"ZAPPING_REFRESH result={(refresh.Success ? "OK" : "FAILED")} mode=visible_profile windowId={windowId} wave={wave} viewerProfile={viewerProfile} diagnostics={refresh.Diagnostics}");
+                    #endif
                     if (!refresh.Success && IsDefinitiveWindowGone(refresh.Diagnostics))
                     {
                         RemoveZappingState(viewerProfile);
                         StopPowerOffForWindow(viewerProfile, windowId);
+                        #if AIRCON_DEVELOPER_DIAGNOSTICS
+                        SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=refresh_target_not_found windowId={windowId} diagnostics={refresh.Diagnostics} backgroundExecution=StopWithWindow");
+                        #endif
                     }
                 }
                 else
                 {
+                    #if AIRCON_DEVELOPER_DIAGNOSTICS
+                    SafeLog($"ZAPPING_BACKGROUND_SYNC result=OK windowId={windowId} wave={wave} viewerProfile={viewerProfile} service={target.ServiceName} action=state_updated_visible_content_unchanged");
+                    #endif
                 }
             }
             return new ZappingTickResult(result.Success, result.Success ? "zapping_tick_ok" : "zapping_tick_failed");
         }
-        catch (Exception)
+        catch (Exception ex)
         {
             RemoveZappingState(viewerProfile);
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=tick_exception");
+            #endif
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog($"ZAPPING_TICK failed viewerProfile={viewerProfile} source={source} exception={ex.GetType().Name} message={ex.Message}");
+            #endif
             return new ZappingTickResult(false, "zapping_tick_exception");
         }
         finally
@@ -836,9 +1005,15 @@ internal sealed class AIrConRenderer
     {
         if (!TryClaimPowerOffExpiry(viewerProfile, windowId, deadline, generation))
         {
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog($"POWER_OFF_TIMER skipped viewerProfile={viewerProfile} generation={generation} reason=inactive_or_superseded");
+            #endif
             return;
         }
 
+        #if AIRCON_DEVELOPER_DIAGNOSTICS
+        SafeLog($"POWER_OFF_TIMER expired viewerProfile={viewerProfile} deadline={deadline:O} generation={generation}");
+        #endif
 
         // StopWithWindowはHostの別状態照会で推測しない。実際のRefresh契約だけを
         // liveness evidenceとして使い、EntityNotFound等が返った場合だけtimerを収束させる。
@@ -846,14 +1021,23 @@ internal sealed class AIrConRenderer
         if (!string.IsNullOrWhiteSpace(windowId))
         {
             var windowRefresh = AIrConNewApiBridge.RefreshToolWindow(windowId, null);
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog($"POWER_OFF_WINDOW_REFRESH result={(windowRefresh.Success ? "OK" : "FAILED")} windowId={windowId} viewerProfile={viewerProfile} diagnostics={windowRefresh.Diagnostics}");
+            #endif
             if (!windowRefresh.Success && IsDefinitiveWindowGone(windowRefresh.Diagnostics))
             {
                 RemoveZappingState(viewerProfile);
                 StopPowerOffForWindow(viewerProfile, windowId);
+                #if AIRCON_DEVELOPER_DIAGNOSTICS
+                SafeLog($"POWER_OFF_TIMER cancelled viewerProfile={viewerProfile} reason=refresh_target_not_found windowId={windowId} diagnostics={windowRefresh.Diagnostics} backgroundExecution=StopWithWindow");
+                #endif
                 return;
             }
         }
 
+        #if AIRCON_DEVELOPER_DIAGNOSTICS
+        SafeLog($"POWER_OFF_TIMER shutdown_started viewerProfile={viewerProfile}");
+        #endif
         HostActionDispatchResult result;
         try
         {
@@ -862,7 +1046,13 @@ internal sealed class AIrConRenderer
         catch (Exception ex)
         {
             result = HostActionDispatchResult.Failure("power_off_timer_exception", ex.Message);
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog($"POWER_OFF_TIMER failed viewerProfile={viewerProfile} exception={ex.GetType().Name} message={ex.Message}");
+            #endif
         }
+        #if AIRCON_DEVELOPER_DIAGNOSTICS
+        SafeLog($"POWER_OFF_TIMER {(result.Success ? "completed" : "failed")} viewerProfile={viewerProfile} result={(result.Success ? "OK" : "FAILED")} diagnostics={result.Diagnostics} message={result.Message}");
+        #endif
 
         // The server-side expiry path has no Safe Event response that can rerender AIrCon.
         // CompleteShutdownAsync already clears both zapping and power-off state before stopping
@@ -872,6 +1062,9 @@ internal sealed class AIrConRenderer
         if (!string.IsNullOrWhiteSpace(windowId))
         {
             var refresh = AIrConNewApiBridge.RefreshToolWindow(windowId, string.Empty);
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog($"POWER_OFF_REFRESH result={(refresh.Success ? "OK" : "FAILED")} windowId={windowId} viewerProfile={viewerProfile} diagnostics={refresh.Diagnostics}");
+            #endif
         }
     }
 
@@ -919,6 +1112,9 @@ internal sealed class AIrConRenderer
         foreach (var staleWindowId in staleWindowIds)
         {
             StopWindowBackgroundExecution(staleWindowId);
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog($"WINDOW_SESSION_STATE result=PRUNED staleWindowId={staleWindowId} currentWindowId={currentWindowId} reason=per_route_window_superseded");
+            #endif
         }
     }
 
@@ -985,10 +1181,16 @@ internal sealed class AIrConRenderer
         try
         {
             var result = await DispatchViewerStopForProfileAsync(viewerProfile, windowId ?? string.Empty, origin).ConfigureAwait(false);
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog($"COMPLETE_SHUTDOWN viewerProfile={viewerProfile} operationGeneration={generation} origin={origin} result={(result.Success ? "OK" : "FAILED")} message={result.Message}");
+            #endif
             return result;
         }
         catch (Exception ex)
         {
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog($"COMPLETE_SHUTDOWN failed viewerProfile={viewerProfile} operationGeneration={generation} origin={origin} exception={ex.GetType().Name} message={ex.Message}");
+            #endif
             return HostActionDispatchResult.Failure("viewer_stop_exception", ex.Message);
         }
         finally
@@ -1035,6 +1237,9 @@ internal sealed class AIrConRenderer
             viewerActivation: viewerActivation).ConfigureAwait(false);
         if (!start.Success)
         {
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog($"VIEWER_SWITCH source={source} phase=tune profileId={viewerProfile} result=FAILED diagnostics={start.Diagnostics}");
+            #endif
             return start;
         }
 
@@ -1043,10 +1248,16 @@ internal sealed class AIrConRenderer
 
         if (start.NetworkId != networkId || start.TransportStreamId != transportStreamId || start.ServiceId != serviceId)
         {
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog($"VIEWER_SWITCH source={source} phase=operation_result profileId={viewerProfile} wave={wave} nid={networkId} tsid={transportStreamId} sid={serviceId} result=FAILED diagnostics=viewer_operation_identity_mismatch");
+            #endif
             return AIrConNewApiBridge.OperationResult.Fail("viewer_operation_identity_mismatch", "Viewer operation returned a different service identity.");
         }
 
         AIrConNewApiBridge.InvalidateViewerProjection();
+        #if AIRCON_DEVELOPER_DIAGNOSTICS
+        SafeLog($"VIEWER_SWITCH source={source} profileId={viewerProfile} oldSession={before?.ViewerSessionId ?? "-"} oldPid={before?.ProcessId?.ToString() ?? "-"} newSession={start.ViewerSessionId} newPid={start.ProcessId?.ToString() ?? "-"} generation={start.Generation} wave={wave} nid={networkId} tsid={transportStreamId} sid={serviceId} result=OK route=runtime_viewer_operation_result projection=viewer_invalidated");
+        #endif
         return start;
     }
 
@@ -1054,6 +1265,9 @@ internal sealed class AIrConRenderer
     {
         var result = await AIrConNewApiBridge.StopAsync(viewerProfile).ConfigureAwait(false);
         if (result.Success) AIrConNewApiBridge.InvalidateViewerProjection();
+        #if AIRCON_DEVELOPER_DIAGNOSTICS
+        SafeLog($"VIEWER_OPERATION action=Stop profileId={viewerProfile} origin=AIrCon reason={origin} result={(result.Success ? "OK" : "FAILED")} diagnostics={result.Diagnostics}");
+        #endif
         return result.Success ? HostActionDispatchResult.Ok(result.Diagnostics) : HostActionDispatchResult.Failure(result.Diagnostics, result.Message);
     }
 
@@ -1074,8 +1288,11 @@ internal sealed class AIrConRenderer
                 .OrderByDescending(x => x.Current)
                 .FirstOrDefault();
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog($"VIEWER_SESSION_LOOKUP failed viewerProfile={viewerProfile} exception={ex.GetType().Name} message={ex.Message}");
+            #endif
             return null;
         }
     }
@@ -1119,22 +1336,116 @@ internal sealed class AIrConRenderer
         return NormalizeViewerProfileId(viewerProfile);
     }
 
+    internal void ApplyViewerOperationPreempting(TvAirViewerOperationPreempting operation)
+    {
+        if (operation == null || string.IsNullOrWhiteSpace(operation.ViewerProfileId) || string.IsNullOrWhiteSpace(operation.ViewerReservationId)) return;
+        ClearAutomaticViewerState(operation.ViewerProfileId);
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+        SafeLog($"VIEWER_OPERATION_PREEMPT viewerProfile={operation.ViewerProfileId} sourceKind={operation.SourceKind} reservation={operation.ViewerReservationId} action=clear_automatic_viewer_state");
+#endif
+    }
+
+    private void ClearAutomaticViewerState(string viewerProfile)
+    {
+        // One profile-scoped boundary for every Host-owned explicit Viewer Operation.
+        // Reservation code does not know individual automation features.
+        NextOperationGeneration(viewerProfile);
+        RemoveZappingState(viewerProfile);
+        SetPowerOffStopped(viewerProfile);
+    }
+
+    internal void ApplyViewerReservationChanged(TvAIrPlugin.Events.PluginEventEnvelope eventEnvelope)
+    {
+        var reservation = TryReadViewerReservation(eventEnvelope.Payload);
+        if (reservation == null || string.IsNullOrWhiteSpace(reservation.ViewerProfileId)) return;
+
+        var completed = eventEnvelope.ChangeKind?.Equals("Completed", StringComparison.OrdinalIgnoreCase) == true
+            || reservation.State.Equals("Completed", StringComparison.OrdinalIgnoreCase);
+        if (!completed) return;
+
+        var wave = ResolveServiceWave(new TvAirServiceIdentityDto
+        {
+            NetworkId = (ushort)reservation.NetworkId,
+            TransportStreamId = (ushort)reservation.TransportStreamId,
+            ServiceId = (ushort)reservation.ServiceId
+        });
+        if (string.IsNullOrWhiteSpace(wave)) return;
+
+        string[] windows;
+        lock (_lastViewerProfileByWindowId) windows = _lastViewerProfileByWindowId.Keys.ToArray();
+        foreach (var windowId in windows)
+        {
+            lock (_lastViewerProfileByWindowId) _lastViewerProfileByWindowId[windowId] = reservation.ViewerProfileId;
+            lock (_lastWaveByWindowId) _lastWaveByWindowId[windowId] = wave;
+            var route = "/plugin/aircon?wave=" + Url(wave) + "&viewerProfile=" + Url(reservation.ViewerProfileId);
+            var refresh = AIrConNewApiBridge.RefreshToolWindow(windowId, route);
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog($"VIEWER_RESERVATION_DISPLAY result={(refresh.Success ? "OK" : "FAILED")} reservation={reservation.ReservationId} viewerProfile={reservation.ViewerProfileId} wave={wave} windowId={windowId} diagnostics={refresh.Diagnostics}");
+#endif
+        }
+    }
+
+    private static TvAirViewerReservationDto? TryReadViewerReservation(object? payload)
+    {
+        if (payload is TvAirEventDto eventDto) return eventDto.ViewerReservation;
+        if (payload is TvAirViewerReservationDto reservation) return reservation;
+        if (payload is TvAirViewerReservation runtimeReservation)
+        {
+            return new TvAirViewerReservationDto
+            {
+                ReservationId = runtimeReservation.ReservationId,
+                ViewerProfileId = runtimeReservation.ViewerProfileId,
+                NetworkId = runtimeReservation.Service.NetworkId,
+                TransportStreamId = runtimeReservation.Service.TransportStreamId,
+                ServiceId = runtimeReservation.Service.ServiceId,
+                EventId = runtimeReservation.EventId,
+                ScheduledStart = runtimeReservation.ScheduledStart,
+                ScheduledEnd = runtimeReservation.ScheduledEnd,
+                State = runtimeReservation.State,
+                FailureReason = runtimeReservation.FailureReason,
+                CreatedAt = runtimeReservation.CreatedAt,
+                UpdatedAt = runtimeReservation.UpdatedAt
+            };
+        }
+        if (payload is JsonElement json)
+        {
+            try
+            {
+                if (json.ValueKind == JsonValueKind.Object &&
+                    (json.TryGetProperty("viewerReservation", out var nested) || json.TryGetProperty("ViewerReservation", out nested)))
+                    return nested.Deserialize<TvAirViewerReservationDto>();
+                return json.Deserialize<TvAirViewerReservationDto>();
+            }
+            catch (JsonException) { return null; }
+        }
+        return null;
+    }
+
     internal void ApplyViewerSessionStatePatch(TvAIrPlugin.Events.PluginEventEnvelope eventEnvelope)
     {
         if (eventEnvelope.Sequence <= 0)
         {
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog($"VIEWER_SESSION_STATEPATCH result=SKIPPED reason=invalid_revision revision={eventEnvelope.Sequence}");
+            #endif
             return;
         }
 
         var viewerSessionId = ResolveViewerSessionId(eventEnvelope.EntityId);
         if (string.IsNullOrWhiteSpace(viewerSessionId))
         {
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog($"VIEWER_SESSION_STATEPATCH result=SKIPPED reason=event_session_missing entityId={eventEnvelope.EntityId ?? "-"} revision={eventEnvelope.Sequence}");
+            #endif
             return;
         }
 
         var eventSession = AIrConNewApiBridge.GetSession(viewerSessionId);
         if (eventSession == null || string.IsNullOrWhiteSpace(eventSession.ViewerProfileId))
         {
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog($"VIEWER_SESSION_STATEPATCH result=SKIPPED reason=event_session_unresolved viewerSession={viewerSessionId} revision={eventEnvelope.Sequence}");
+            #endif
             return;
         }
 
@@ -1144,6 +1455,9 @@ internal sealed class AIrConRenderer
             && !eventSession.State.Equals("closed", StringComparison.OrdinalIgnoreCase);
         if (active)
         {
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog($"VIEWER_SESSION_STATEPATCH result=SKIPPED reason=viewer_still_active viewerSession={viewerSessionId} viewerProfile={viewerProfile} revision={eventEnvelope.Sequence}");
+            #endif
             return;
         }
 
@@ -1161,6 +1475,9 @@ internal sealed class AIrConRenderer
 
         if (targetWindows.Length == 0)
         {
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog($"VIEWER_SESSION_STATEPATCH result=SKIPPED reason=event_profile_not_displayed viewerSession={viewerSessionId} viewerProfile={viewerProfile} active=False backgroundStateCleared=True revision={eventEnvelope.Sequence}");
+            #endif
             return;
         }
 
@@ -1226,6 +1543,9 @@ internal sealed class AIrConRenderer
             }
 
             var result = AIrConNewApiBridge.PatchToolWindow(windowId, patches, eventEnvelope.Sequence);
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog($"VIEWER_SESSION_STATEPATCH result={(result.Success ? "OK" : "FAILED")} windowId={windowId} viewerSession={viewerSessionId} viewerProfile={viewerProfile} active=False lifecycleAuthority=runtime_viewer_session terminalWave={terminalWave} displayedWave={displayedWave} backgroundStateCleared=True revision={eventEnvelope.Sequence} diagnostics={result.Diagnostics}");
+            #endif
             if (result.Success && result.Diagnostics.Contains("reason=window_closed", StringComparison.OrdinalIgnoreCase))
                 StopWindowBackgroundExecution(windowId);
         }
@@ -1345,13 +1665,22 @@ internal sealed class AIrConRenderer
                     runtimeSelectable.FirstOrDefault(x => x.IsDefault)?.Id,
                     runtimeSelectable.FirstOrDefault()?.Id);
                 var runtimeVisible = runtimeSelectable.Count >= 2;
+                #if AIRCON_DEVELOPER_DIAGNOSTICS
+                SafeLog("VIEWER_PROFILE_SELECTOR source=runtime_viewers_api profiles=" + runtimeSelectable.Count + " visible=" + runtimeVisible + " default=" + runtimeDefaultId + " profileIds=" + string.Join(",", runtimeSelectable.Select(x => x.Id)));
+                #endif
                 return new ViewerProfileState(runtimeSelectable, runtimeDefaultId, runtimeVisible, true, true);
             }
 
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog("VIEWER_PROFILE_SELECTOR source=runtime_viewers_api profiles=0 visible=False fallback=none");
+            #endif
             return ViewerProfileState.Unavailable;
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog("VIEWER_PROFILE_SELECTOR exception=" + ex.GetType().Name + " " + ex.Message);
+            #endif
             return ViewerProfileState.Unavailable;
         }
     }
@@ -1475,6 +1804,8 @@ internal sealed class AIrConRenderer
         var sessions = new List<ViewerSessionRow>();
         var tuners = new List<ViewerTunerRow>();
         var waveFilters = new List<WaveFilterRow>();
+        var programEvents = new List<TvAirProgramEventDto>();
+        var viewerReservations = new List<TvAirViewerReservation>();
         var diagnostics = new List<string>();
         var projectionUsed = false;
         var safeEventContractAvailable = false;
@@ -1501,15 +1832,22 @@ internal sealed class AIrConRenderer
             diagnostics.Add("waveFilters=Runtime count=" + waveFilters.Count);
 
             var now = DateTimeOffset.Now;
-            var events = AIrConNewApiBridge.ListProgramEvents(now, now.AddHours(6));
-            var applied = ApplyRuntimeNowNext(services, events, now);
+            programEvents = AIrConNewApiBridge.ListProgramEvents(now, now.AddHours(6)).ToList();
+            var applied = ApplyRuntimeNowNext(services, programEvents, now);
             projectionUsed = true;
-            diagnostics.Add("programGuide=Runtime overlayNowNext=" + applied + " events=" + events.Count + " listAuthority=runtime_channels");
+            diagnostics.Add("programGuide=Runtime overlayNowNext=" + applied + " events=" + programEvents.Count + " listAuthority=runtime_channels");
         }
         catch (Exception ex)
         {
             diagnostics.Add("runtimeProjection exception=" + ex.Message);
         }
+
+        try
+        {
+            viewerReservations = AIrConNewApiBridge.ListViewerReservations().Where(x => x.State.Equals("Scheduled", StringComparison.OrdinalIgnoreCase)).ToList();
+            diagnostics.Add("viewerReservations=Runtime scheduled=" + viewerReservations.Count);
+        }
+        catch (Exception ex) { diagnostics.Add("viewerReservations exception=" + ex.Message); }
 
         try
         {
@@ -1523,6 +1861,9 @@ services = NormalizeViewerServiceAuthority(services, diagnostics);
         var zeroTripletFinal = services.Count(x => x.NetworkId <= 0 || x.TransportStreamId <= 0 || x.ServiceId <= 0);
         if (zeroTripletFinal > 0)
         {
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog("TRIPLET_DIAG finalZero=" + zeroTripletFinal);
+            #endif
         }
 
         if (waveFilters.Count == 0)
@@ -1555,10 +1896,16 @@ services = NormalizeViewerServiceAuthority(services, diagnostics);
             .OrderBy(x => x.ProgramGuideOrder)
             .ToList();
 
+        #if AIRCON_DEVELOPER_DIAGNOSTICS
+        SafeLog("WAVE_CLASSIFICATION requested=" + filter
+            + " totalRows=" + services.Count
+            + " renderedCount=" + filtered.Count
+            + " rule=viewer_service_authority_triplet_overlay_only");
+        #endif
 
         var serviceColumnWidth = CalculateServiceColumnWidth(services);
 
-        return new FloatingViewerData(filtered, sessions, tuners, waveFilters, viewerProfiles, diagnostics, projectionUsed, safeEventContractAvailable, safeDblclickEvents, serviceColumnWidth);
+        return new FloatingViewerData(filtered, sessions, tuners, waveFilters, viewerProfiles, programEvents, viewerReservations, diagnostics, projectionUsed, safeEventContractAvailable, safeDblclickEvents, serviceColumnWidth);
     }
 
     private static List<ServiceRow> NormalizeViewerServiceAuthority(IReadOnlyList<ServiceRow> source, List<string> diagnostics)
@@ -1694,7 +2041,7 @@ services = NormalizeViewerServiceAuthority(services, diagnostics);
 
     private static string ResolveWindowStateEndpoint(RuntimeUiRenderContext c, IReadOnlyDictionary<string, string> contract, string windowId)
     {
-        // Compatibility only: official no longer calls this endpoint from RenderHtml.
+        // Compatibility path only: current RenderHtml no longer calls this endpoint.
         // TvAIr SDK contract supplies direct CurrentWindowAlwaysOnTop state instead.
         var escapedWindowId = Uri.EscapeDataString(windowId ?? string.Empty);
         var absolute = FirstNonEmpty(
@@ -2009,6 +2356,7 @@ services = NormalizeViewerServiceAuthority(services, diagnostics);
         var tunerChoices = BuildTunerChoices(data.ViewerTuners, filter).ToList();
         var selected = ResolveSelectedTuner(tunerChoices, selectedTunerValue);
         var rows = BuildRows(context, data.Services, data.ViewerSessions, action, window, selected, selectedViewerProfile, filter, zappingActive, activeZappingWave, powerOffDeadline);
+        var reservationMenu = BuildViewerReservationMenu(context, data, action, window, filter, selectedViewerProfile.Value);
         var toolbar = BuildToolbar(context, data.WaveFilters, data.ViewerSessions, data.ViewerProfiles, action, window, filter, selected.Value, selectedViewerProfile, alwaysOnTop);
         return $$"""
 <!doctype html>
@@ -2025,13 +2373,36 @@ services = NormalizeViewerServiceAuthority(services, diagnostics);
   <div class="aircon-list" id="aircon-service-list">
     {{rows}}
   </div>
+  {{reservationMenu}}
   <script>
   (function(){
     var list=document.getElementById('aircon-service-list');
     var row=document.getElementById('aircon-current-viewing-anchor');
-    if(!list||!row)return;
-    var top=row.offsetTop-Math.floor((list.clientHeight-row.offsetHeight)/2);
-    list.scrollTop=Math.max(0,top);
+    if(list&&row){
+      var top=row.offsetTop-Math.floor((list.clientHeight-row.offsetHeight)/2);
+      list.scrollTop=Math.max(0,top);
+    }
+    var menu=document.getElementById('aircon-reservation-menu');
+    if(!list||!menu)return;
+    function closeMenu(){menu.style.display='none';var sections=menu.getElementsByClassName('aircon-reservation-section');for(var i=0;i<sections.length;i++)sections[i].style.display='none';}
+    list.oncontextmenu=function(ev){
+      ev=ev||window.event;var el=ev.target||ev.srcElement;
+      while(el&&el!==list&&!((' '+el.className+' ').indexOf(' aircon-row ')>=0))el=el.parentNode;
+      if(!el||el===list||!el.getAttribute('data-aircon-service-id'))return true;
+      if(ev.preventDefault)ev.preventDefault();ev.returnValue=false;
+      closeMenu();
+      var section=document.getElementById('aircon-reservation-'+el.getAttribute('data-aircon-service-id'));
+      if(!section)return false;
+      section.style.display='block';menu.style.display='block';
+      var x=ev.clientX||0,y=ev.clientY||0;menu.style.left=x+'px';menu.style.top=y+'px';
+      var r=menu.getBoundingClientRect();
+      if(r.right>document.documentElement.clientWidth)menu.style.left=Math.max(0,document.documentElement.clientWidth-r.width-4)+'px';
+      if(r.bottom>document.documentElement.clientHeight)menu.style.top=Math.max(0,document.documentElement.clientHeight-r.height-4)+'px';
+      return false;
+    };
+    document.onclick=function(ev){var t=(ev||window.event).target||window.event.srcElement;if(menu.style.display==='block'&&!menu.contains(t))closeMenu();};
+    document.onkeydown=function(ev){ev=ev||window.event;if(ev.keyCode===27)closeMenu();};
+    list.onscroll=closeMenu;
   })();
   </script>
 </div>
@@ -2151,6 +2522,18 @@ body.aircon-runtime-root{position:static;}
 .aircon-sleep-select,.aircon-sleep-remaining{margin-right:9px;}
 .aircon-sleep-remaining{display:inline-flex;align-items:center;justify-content:center;min-width:45px;height:22px;line-height:20px;padding:0 4px;border:1px solid;border-radius:3px;box-sizing:border-box;font-size:11px;font-weight:bold;text-align:center;vertical-align:middle;}
 .aircon-sleep-hidden{display:none;}
+.aircon-reservation-menu{display:none;position:fixed;z-index:20;min-width:300px;max-width:440px;max-height:70%;overflow-y:auto;background:var(--aircon-surface);border:1px solid var(--aircon-border);box-shadow:0 3px 10px rgba(0,0,0,.35);padding:3px;}
+.aircon-reservation-section{display:none;}
+.aircon-reservation-program{display:block;position:relative;min-height:34px;padding:4px 76px 4px 6px;border-bottom:1px solid var(--aircon-border);background:var(--aircon-row);}
+.aircon-reservation-program:last-child{border-bottom:0;}
+.aircon-reservation-time{display:block;color:var(--aircon-muted);font-size:10px;line-height:12px;}
+.aircon-reservation-title{display:block;color:var(--aircon-text);font-size:11px;font-weight:bold;line-height:15px;white-space:normal;}
+.aircon-reservation-targets{position:absolute;right:5px;top:6px;display:flex;gap:3px;}
+.aircon-reservation-target{min-width:30px;height:22px;padding:0 5px;border:1px solid var(--aircon-control-border);background:var(--aircon-input);color:var(--aircon-control-text);border-radius:3px;font:700 11px Meiryo,"Yu Gothic",Arial,sans-serif;cursor:pointer;}
+.aircon-reservation-target:hover{background:var(--aircon-control-hover);border-color:var(--aircon-control-hover-border);}
+.aircon-reservation-target-on{background:var(--aircon-accent);color:var(--aircon-accent-text);border-color:var(--aircon-button-border);}
+.aircon-reservation-target-conflict,.aircon-reservation-target:disabled{opacity:.42;cursor:default;background:var(--aircon-disabled-bg);color:var(--aircon-disabled-text);border-color:var(--aircon-disabled-border);}
+.aircon-reservation-empty{padding:9px;color:var(--aircon-muted);font-size:11px;}
 @media(max-width:360px){.aircon-zapping-bar{gap:4px;padding-left:5px;padding-right:5px}.aircon-sleep-right{padding-left:5px}.aircon-zapping-label,.aircon-sleep-label{margin-right:4px;font-size:10px}.aircon-zapping-status,.aircon-sleep-select,.aircon-sleep-remaining{margin-right:5px}.aircon-zapping-status{min-width:38px;padding-left:5px;padding-right:5px}.aircon-zapping-button{min-width:40px;padding-left:5px;padding-right:5px} }
 @media(max-width:285px){.aircon-zapping-label,.aircon-sleep-label{display:none}.aircon-sleep-right{border-left:0;padding-left:0} }
 .aircon-empty{padding:16px;color:var(--aircon-muted);}
@@ -2225,7 +2608,7 @@ body.aircon-runtime-root{position:static;}
         {
             var active = p.Id.Equals(selectedViewerProfile, StringComparison.OrdinalIgnoreCase);
             var groups = p.AvailableGroups == null || p.AvailableGroups.Count == 0 ? "ALL" : string.Join(",", p.AvailableGroups);
-            var displayLabel = ViewerProfileSegmentLabel(p);
+            var displayLabel = ViewerProfileSegmentLabel(p, filter);
             var sharedSuffix = p.IsShared ? "（共用）" : string.Empty;
             var title = p.Name + sharedSuffix;
             var cls = "aircon-toolbar-button aircon-profile-button" + (active ? " aircon-profile-button-on" : string.Empty);
@@ -2244,19 +2627,19 @@ body.aircon-runtime-root{position:static;}
         return "<div class='aircon-toolbar-profile-slot aircon-profile-form' data-role='viewer-profile-selector'" +
             " data-tvair-current-viewer-profile='" + HtmlAttr(selectedViewerProfile) + "'" +
             " data-tvair-profile-count='" + state.SelectableProfiles.Count.ToString(System.Globalization.CultureInfo.InvariantCulture) + "'>" +
-            "<span class='aircon-profile-label'>" + (NormalizeWaveFilter(filter) == "GR" ? "チューナーT:" : "チューナーS:") + "</span>" +
+            "<span class='aircon-profile-label'>チューナー </span>" +
             "<span class='aircon-profile-segments' role='group' aria-label='TVTest'>" + string.Join("", buttons) + "</span>" +
             "</div>";
     }
 
-    private static string ViewerProfileSegmentLabel(ViewerProfileChoice profile)
+    private static string ViewerProfileSegmentLabel(ViewerProfileChoice profile, string wave)
     {
-        // Device number is projected directly from the TvAIr Viewer Profile contract.
-        // Do not infer or renumber it from enumeration order, display name, DID, or logical slot.
+        // User-visible identity follows the TvAIr settings virtual-slot identifier (Tn/Sn).
+        // ViewerProfileId remains the internal authority; physical tuner identity is never shown here.
         var frame = profile.TvTestFrameIndex > 0
             ? profile.TvTestFrameIndex.ToString(System.Globalization.CultureInfo.InvariantCulture)
             : "?";
-        return profile.IsShared ? frame + "共" : frame;
+        return (NormalizeWaveFilter(wave) == "GR" ? "T" : "S") + frame;
     }
 
     private static IReadOnlyList<WaveFilterRow> CanonicalWaveFilters(IReadOnlyList<WaveFilterRow> source)
@@ -2278,7 +2661,7 @@ body.aircon-runtime-root{position:static;}
             .FirstOrDefault();
         foreach (var row in services)
         {
-            // official: wave is already represented by the active toolbar button.
+            // The active toolbar button already represents the selected wave.
             // Do not render an additional GR/BS/CS section band inside the scroll area.
             parts.Add(BuildServiceRow(context, row, action, window, selectedTuner, selectedViewerProfile, selectedSession, rowIndex++, zappingActive));
         }
@@ -2332,6 +2715,71 @@ body.aircon-runtime-root{position:static;}
             + "</form></div>";
     }
 
+    private static string BuildViewerReservationMenu(RuntimeUiRenderContext context, FloatingViewerData data, ViewerOperation action, WindowOperation window, string filter, string displayedViewerProfile)
+    {
+        var now = DateTimeOffset.Now;
+        var limit = now.AddHours(6);
+        var profiles = data.ViewerProfiles.AvailableForWave(filter).ToArray();
+        if (profiles.Length == 0) return "<div id=\"aircon-reservation-menu\" class=\"aircon-reservation-menu\"></div>";
+
+        var sections = new List<string>();
+        foreach (var service in data.Services.Where(HasResolvedTriplet))
+        {
+            var events = data.ProgramEvents
+                .Where(x => x.NetworkId == service.NetworkId && x.TransportStreamId == service.TransportStreamId && x.ServiceId == service.ServiceId)
+                .Where(x => x.Start > now && x.Start < limit && x.End > x.Start && x.EventNumber is >= 0 and <= ushort.MaxValue)
+                .OrderBy(x => x.Start)
+                .ToArray();
+            var items = new List<string>();
+            foreach (var program in events)
+            {
+                var buttons = new List<string>();
+                foreach (var profile in profiles)
+                {
+                    var existing = data.ViewerReservations.FirstOrDefault(x =>
+                        x.ViewerProfileId.Equals(profile.Value, StringComparison.OrdinalIgnoreCase) &&
+                        x.Service.NetworkId == service.NetworkId && x.Service.TransportStreamId == service.TransportStreamId && x.Service.ServiceId == service.ServiceId &&
+                        x.EventId == (ushort)program.EventNumber && x.State.Equals("Scheduled", StringComparison.OrdinalIgnoreCase));
+                    var conflict = existing == null && data.ViewerReservations.Any(x =>
+                        x.ViewerProfileId.Equals(profile.Value, StringComparison.OrdinalIgnoreCase) &&
+                        x.State.Equals("Scheduled", StringComparison.OrdinalIgnoreCase) &&
+                        x.ScheduledStart == program.Start);
+                    var label = ViewerProfileSegmentLabel(profile, filter);
+                    if (conflict)
+                    {
+                        buttons.Add("<button type=\"button\" class=\"aircon-reservation-target aircon-reservation-target-conflict\" disabled aria-disabled=\"true\" title=\"同時刻に別の視聴予約があります\">" + Html(label) + "</button>");
+                        continue;
+                    }
+                    var fields = new Dictionary<string, string?>
+                    {
+                        ["operation"] = AirConActionViewerReservationToggle,
+                        ["airconAction"] = AirConActionViewerReservationToggle,
+                        ["wave"] = filter,
+                        ["viewerProfile"] = profile.Value,
+                        ["returnViewerProfile"] = displayedViewerProfile,
+                        ["networkId"] = service.NetworkId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                        ["transportStreamId"] = service.TransportStreamId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                        ["serviceId"] = service.ServiceId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                        ["eventId"] = program.EventNumber.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                        ["scheduledStart"] = program.Start.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+                        ["scheduledEnd"] = program.End.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+                        ["reservationId"] = existing?.ReservationId ?? string.Empty,
+                        ["refreshQuery"] = "wave=" + filter + "&viewerProfile=" + profile.Value,
+                        ["clientVersion"] = ClientVersion
+                    };
+                    var attrs = BuildHostActionAttributes(context, fields, "click", "refreshWindow");
+                    var cls = "aircon-reservation-target" + (existing != null ? " aircon-reservation-target-on" : string.Empty);
+                    var title = existing != null ? "解除" : "登録";
+                    buttons.Add("<button type=\"button\" class=\"" + cls + "\" " + attrs + " title=\"" + title + "\">" + Html(label) + "</button>");
+                }
+                items.Add("<div class=\"aircon-reservation-program\"><span class=\"aircon-reservation-time\">" + Html(program.Start.ToLocalTime().ToString("HH:mm", System.Globalization.CultureInfo.InvariantCulture)) + " - " + Html(program.End.ToLocalTime().ToString("HH:mm", System.Globalization.CultureInfo.InvariantCulture)) + "</span><span class=\"aircon-reservation-title\">" + Html(program.Title) + "</span><span class=\"aircon-reservation-targets\">" + string.Join("", buttons) + "</span></div>");
+            }
+            if (items.Count == 0) items.Add("<div class=\"aircon-reservation-empty\">6時間以内の番組がありません。</div>");
+            sections.Add("<div id=\"aircon-reservation-" + HtmlAttr(BuildServiceDomId(service)) + "\" class=\"aircon-reservation-section\">" + string.Join("", items) + "</div>");
+        }
+        return "<div id=\"aircon-reservation-menu\" class=\"aircon-reservation-menu\">" + string.Join("", sections) + "</div>";
+    }
+
     private static string BuildServiceRow(RuntimeUiRenderContext context, ServiceRow row, ViewerOperation action, WindowOperation window, TunerChoice selectedTuner, ViewerProfileChoice selectedViewerProfile, ViewerSessionRow? selectedSession, int rowIndex, bool zappingActive)
     {
         var hasTriplet = HasResolvedTriplet(row);
@@ -2344,7 +2792,7 @@ body.aircon-runtime-root{position:static;}
             : isOtherProfileViewing
                 ? "aircon-row aircon-row-viewing-other"
                 : hasTriplet ? "aircon-row " + parityClass : "aircon-row aircon-row-disabled";
-        var title = hasTriplet ? "ダブルクリックで視聴" : "このチャンネルは現在視聴できません";
+        var title = hasTriplet ? "ダブルクリックで視聴 / 右クリックで視聴予約" : "このチャンネルは現在視聴できません";
         var current = string.IsNullOrWhiteSpace(row.CurrentTitle) ? "番組情報取得中" : row.CurrentTitle;
         var currentClass = "aircon-current";
         var currentTitleAttr = " title=\"" + HtmlAttr(current) + "\"";
@@ -3012,6 +3460,19 @@ body.aircon-runtime-root{position:static;}
     private static string FirstNonEmpty(params string?[] values) => values.FirstOrDefault(x => !string.IsNullOrWhiteSpace(x))?.Trim() ?? string.Empty;
     private static string Html(string? value) => WebUtility.HtmlEncode(value ?? string.Empty);
     private static string HtmlAttr(string? value) => Html(value).Replace("\"", "&quot;");
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+
+    // Developer Diagnostics canonical boundary. Calls to this method are removed by the compiler
+    // when AIRCON_DEVELOPER_DIAGNOSTICS is not defined (Public build), including argument evaluation.
+    // Public builds therefore do not construct or emit these diagnostic messages.
+    [System.Diagnostics.Conditional("AIRCON_DEVELOPER_DIAGNOSTICS")]
+    private void SafeLog(string message)
+    {
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+        try { AIrConNewApiBridge.LogInfo("AIrCon: " + message); } catch { }
+#endif
+    }
+#endif
 
     private sealed record ViewerSessionContractState(string ViewerSessionId, long Generation);
     private sealed record ZappingState(bool Active, DateTimeOffset StartedAt, DateTimeOffset LastTickAt, DateTimeOffset NextTickAt, string LastServiceKey, string WindowId, string Wave, string ViewerProfile, long Generation, string ViewerSessionId, long ViewerGeneration, int ProcessId, int IntervalSeconds);
@@ -3024,7 +3485,7 @@ body.aircon-runtime-root{position:static;}
     }
 
     private sealed record ViewerStartPayload(string NetworkId, string TransportStreamId, string ServiceId, string ChannelSpace, string ChannelIndex, string ChannelArgument, string ProgramGuideFilterGroup, string BroadcastGroup, string AllocationGroup, string TunerGroup, string ServiceName, string PreferredTunerName, string PreferredDid, string PreferredSlot, string ViewerProfile, string ViewerProfileName);
-    private sealed record FloatingViewerData(IReadOnlyList<ServiceRow> Services, IReadOnlyList<ViewerSessionRow> ViewerSessions, IReadOnlyList<ViewerTunerRow> ViewerTuners, IReadOnlyList<WaveFilterRow> WaveFilters, ViewerProfileState ViewerProfiles, IReadOnlyList<string> Diagnostics, bool ProjectionUsed, bool SafeEventContractAvailable, bool SafeDblclickEvents, int ServiceColumnWidthPx);
+    private sealed record FloatingViewerData(IReadOnlyList<ServiceRow> Services, IReadOnlyList<ViewerSessionRow> ViewerSessions, IReadOnlyList<ViewerTunerRow> ViewerTuners, IReadOnlyList<WaveFilterRow> WaveFilters, ViewerProfileState ViewerProfiles, IReadOnlyList<TvAirProgramEventDto> ProgramEvents, IReadOnlyList<TvAirViewerReservation> ViewerReservations, IReadOnlyList<string> Diagnostics, bool ProjectionUsed, bool SafeEventContractAvailable, bool SafeDblclickEvents, int ServiceColumnWidthPx);
     private sealed record ViewerOperation(bool CanPost, string ActionEndpoint, string ActionRoute, string ActionMethod, string ActionToken, string PluginId, string RouteSegment);
     private sealed record HostActionDispatchResult(bool Success, string Diagnostics, string Message)
     {
@@ -3114,6 +3575,9 @@ public sealed class AIrConRuntimePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirR
             PluginPermission.ReadTheme,
             PluginPermission.ReadPluginStorage,
             PluginPermission.WritePluginStorage
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+            , PluginPermission.WriteLogs
+#endif
         },
         Assets = new[]
         {
@@ -3180,11 +3644,22 @@ public sealed class AIrConRuntimePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirR
         _runtimeEventSubscriptions?.Dispose();
         _runtimeEventSubscriptions = AIrConNewApiBridge.SubscribeRuntimeEvents((eventType, eventEnvelope) =>
         {
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            AIrConNewApiBridge.LogInfo($"PROJECTION_INVALIDATE source={eventType} action=invalidate_only windowRefresh=none rule=aircon_projection_single_source");
+            #endif
             if (eventType.Equals("ViewerSessionChanged", StringComparison.OrdinalIgnoreCase) && eventEnvelope != null)
                 _ui.ApplyViewerSessionStatePatch(eventEnvelope);
             else if (eventType.Equals("RuntimeWindowLifecycleChanged", StringComparison.OrdinalIgnoreCase) && eventEnvelope != null)
                 _ui.ApplyRuntimeWindowLifecycle(eventEnvelope);
-        });
+            else if (eventType.Equals("ViewerReservationChanged", StringComparison.OrdinalIgnoreCase) && eventEnvelope != null)
+                _ui.ApplyViewerReservationChanged(eventEnvelope);
+        }, _ui.ApplyViewerOperationPreempting);
+        #if AIRCON_DEVELOPER_DIAGNOSTICS
+        AIrConNewApiBridge.LogInfo($"PLACEMENT_POLICY_SYNC result={(placement.Success ? "OK" : "FAILED")} rememberPlacement={settings.RememberWindowPlacement} diagnostics={placement.Diagnostics}");
+        #endif
+        #if AIRCON_DEVELOPER_DIAGNOSTICS
+        AIrConNewApiBridge.LogInfo("PROJECTION_LIFECYCLE result=STARTED service=plugin_instance viewerProfile=plugin_instance viewerSession=plugin_instance program=plugin_instance subscriptions=ProgramGuideUpdated,ViewerSessionChanged,SettingsChanged,RuntimeWindowLifecycleChanged,ViewerReservationChanged,ViewerOperationPreempting rule=aircon_projection_single_source");
+        #endif
     }
     public void OnStop()
     {
@@ -3226,7 +3701,7 @@ internal static class AIrConNewApiBridge
         }
     }
 
-    internal static IDisposable SubscribeRuntimeEvents(Action<string, TvAIrPlugin.Events.PluginEventEnvelope?> onInvalidated)
+    internal static IDisposable SubscribeRuntimeEvents(Action<string, TvAIrPlugin.Events.PluginEventEnvelope?> onInvalidated, Action<TvAirViewerOperationPreempting> onViewerOperationPreempting)
     {
         var registrations = new List<IDisposable>();
         lock (Sync)
@@ -3253,6 +3728,11 @@ internal static class AIrConNewApiBridge
             {
                 onInvalidated("RuntimeWindowLifecycleChanged", eventEnvelope);
             }));
+            registrations.Add(context.Events.Subscribe("ViewerReservationChanged", eventEnvelope =>
+            {
+                onInvalidated("ViewerReservationChanged", eventEnvelope);
+            }));
+            registrations.Add(context.Viewers.SubscribeOperationPreempting(onViewerOperationPreempting));
         }
         return new CompositeDisposable(registrations);
     }
@@ -3301,6 +3781,23 @@ internal static class AIrConNewApiBridge
         _programProjectionTo = default;
         _programProjectionExpiresAt = default;
     }
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+
+    // Developer-only log sink. In Public builds callers are compiled out and the sink body itself
+    // is excluded, so no Runtime Logs.Write path remains executable from AIrCon.
+    [System.Diagnostics.Conditional("AIRCON_DEVELOPER_DIAGNOSTICS")]
+    internal static void LogInfo(string message)
+    {
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+        lock (Sync)
+        {
+            var context = _runtimeContext;
+            if (context == null) return;
+            context.Logs.Write(new TvAirLogWriteDto { Level = "Info", Category = "AIrCon", Message = message });
+        }
+#endif
+    }
+#endif
 
     internal static AirConSettings LoadSettings()
     {
@@ -3501,6 +3998,9 @@ internal static class AIrConNewApiBridge
             if (_serviceProjection != null) return _serviceProjection;
             _serviceProjection = _runtimeContext?.Channels.ListServices(new TvAirServiceQueryDto { Enabled = true }).ToArray()
                 ?? Array.Empty<TvAirServiceDto>();
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            LogProjection("SERVICE_PROJECTION", "MISS", _serviceProjection.Length);
+            #endif
             return _serviceProjection;
         }
     }
@@ -3512,6 +4012,9 @@ internal static class AIrConNewApiBridge
             if (_waveFilterProjection != null) return _waveFilterProjection;
             _waveFilterProjection = _runtimeContext?.ProgramGuide.ListWaveFilters().ToArray()
                 ?? Array.Empty<TvAirProgramGuideWaveFilterDto>();
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            LogProjection("WAVE_FILTER_PROJECTION", "MISS", _waveFilterProjection.Length);
+            #endif
             return _waveFilterProjection;
         }
     }
@@ -3549,9 +4052,15 @@ internal static class AIrConNewApiBridge
                     .Min();
                 var safetyExpiry = now.AddMinutes(5);
                 _programProjectionExpiresAt = nextBoundary < safetyExpiry ? nextBoundary : safetyExpiry;
+                #if AIRCON_DEVELOPER_DIAGNOSTICS
+                LogProgramProjection("MISS", _programProjection.Length, queryFrom, queryTo, _programProjectionExpiresAt);
+                #endif
             }
             else
             {
+                #if AIRCON_DEVELOPER_DIAGNOSTICS
+                LogProgramProjection("HIT", _programProjection!.Length, _programProjectionFrom, _programProjectionTo, _programProjectionExpiresAt);
+                #endif
             }
             return _programProjection!
                 .Where(x => x.End > from && x.Start < to)
@@ -3565,6 +4074,9 @@ internal static class AIrConNewApiBridge
         {
             if (_viewerProfileProjection != null) return _viewerProfileProjection;
             _viewerProfileProjection = _runtimeContext?.Viewers.ListProfiles().ToArray() ?? Array.Empty<TvAIrPlugin.Viewers.TvAirViewerProfileDto>();
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            LogProjection("VIEWER_PROFILE_PROJECTION", "MISS", _viewerProfileProjection.Length);
+            #endif
             return _viewerProfileProjection;
         }
     }
@@ -3575,9 +4087,46 @@ internal static class AIrConNewApiBridge
         {
             if (_viewerSessionProjection != null) return _viewerSessionProjection;
             _viewerSessionProjection = _runtimeContext?.Viewers.ListSessions().ToArray() ?? Array.Empty<TvAIrPlugin.Viewers.TvAirViewerSessionDto>();
+            #if AIRCON_DEVELOPER_DIAGNOSTICS
+            LogProjection("VIEWER_SESSION_PROJECTION", "MISS", _viewerSessionProjection.Length);
+            #endif
             return _viewerSessionProjection;
         }
     }
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+
+    [System.Diagnostics.Conditional("AIRCON_DEVELOPER_DIAGNOSTICS")]
+    private static void LogProgramProjection(string result, int count, DateTimeOffset from, DateTimeOffset to, DateTimeOffset expiresAt)
+    {
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+        var context = _runtimeContext;
+        if (context == null) return;
+        context.Logs.Write(new TvAirLogWriteDto
+        {
+            Level = "Info",
+            Category = "AIrCon",
+            Message = $"PROGRAM_NOW_NEXT_PROJECTION result={result} count={count} cacheFrom={from:O} cacheTo={to:O} expiresAt={expiresAt:O} owner=plugin_instance invalidation=event_boundary_or_manual_refresh rule=aircon_projection_single_source"
+        });
+#endif
+    }
+#endif
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+
+    [System.Diagnostics.Conditional("AIRCON_DEVELOPER_DIAGNOSTICS")]
+    private static void LogProjection(string name, string result, int count)
+    {
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+        var context = _runtimeContext;
+        if (context == null) return;
+        context.Logs.Write(new TvAirLogWriteDto
+        {
+            Level = "Info",
+            Category = "AIrCon",
+            Message = $"{name} result={result} count={count} owner=plugin_instance invalidation=event_or_manual_refresh rule=aircon_projection_single_source"
+        });
+#endif
+    }
+#endif
 
     private sealed class CompositeDisposable : IDisposable
     {
@@ -3603,6 +4152,53 @@ internal static class AIrConNewApiBridge
             if (context == null || string.IsNullOrWhiteSpace(viewerSessionId)) return null;
             return context.Viewers.GetSession(viewerSessionId);
         }
+    }
+
+    internal static IReadOnlyList<TvAirViewerReservation> ListViewerReservations()
+    {
+        lock (Sync)
+        {
+            var context = RequireRuntimeContext();
+            return context.ViewerReservations.List(new TvAirViewerReservationQuery { IncludeTerminal = false }).ToArray();
+        }
+    }
+
+    internal static async Task<OperationResult> CreateViewerReservationAsync(string viewerProfileId, ushort networkId, ushort transportStreamId, ushort serviceId, ushort eventId, DateTimeOffset scheduledStart, DateTimeOffset scheduledEnd)
+    {
+        try
+        {
+            var context = RequireRuntimeContext();
+            var result = await context.ViewerReservations.CreateAsync(new TvAirViewerReservationCreateRequest
+            {
+                ViewerProfileId = viewerProfileId,
+                Service = new TvAirServiceIdentityDto
+                {
+                    NetworkId = networkId,
+                    TransportStreamId = transportStreamId,
+                    ServiceId = serviceId
+                },
+                EventId = eventId,
+                ScheduledStart = scheduledStart,
+                ScheduledEnd = scheduledEnd
+            }).ConfigureAwait(false);
+            return result.Succeeded && result.Value != null
+                ? OperationResult.Ok("viewer_reservation_created")
+                : OperationResult.Fail(result.Error?.Code.ToString() ?? "viewer_reservation_create_failed", result.Error?.Message ?? "視聴予約を登録できません。");
+        }
+        catch (Exception ex) { return OperationResult.Fail(ex.GetType().Name, ex.Message); }
+    }
+
+    internal static async Task<OperationResult> CancelViewerReservationAsync(string reservationId)
+    {
+        try
+        {
+            var context = RequireRuntimeContext();
+            var result = await context.ViewerReservations.CancelAsync(reservationId).ConfigureAwait(false);
+            return result.Succeeded
+                ? OperationResult.Ok("viewer_reservation_cancelled")
+                : OperationResult.Fail(result.Error?.Code.ToString() ?? "viewer_reservation_cancel_failed", result.Error?.Message ?? "視聴予約を解除できません。");
+        }
+        catch (Exception ex) { return OperationResult.Fail(ex.GetType().Name, ex.Message); }
     }
 
     internal static async Task<OperationResult> TuneAsync(string viewerProfileId, string wave, int networkId, int transportStreamId, int serviceId, string? requiredSessionId = null, long? requiredGeneration = null, int? requiredProcessId = null, string? viewerActivation = null)

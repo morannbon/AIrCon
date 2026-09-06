@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net8.0-windows</TargetFramework>
     <Nullable>enable</Nullable>
@@ -7,13 +7,29 @@
     <Platforms>AnyCPU;x86;x64</Platforms>
     <RootNamespace>AIrCon.BasicPlugin</RootNamespace>
     <AssemblyName>AIrCon.BasicPlugin</AssemblyName>
-    <Version>1.0.3</Version>
-    <FileVersion>1.0.3.0</FileVersion>
-    <AssemblyVersion>1.0.3.0</AssemblyVersion>
-    <InformationalVersion>1.0.3</InformationalVersion>
+    <Version>1.0.4</Version>
+    <FileVersion>1.0.4.0</FileVersion>
+    <AssemblyVersion>1.0.4.0</AssemblyVersion>
+    <InformationalVersion>1.0.4</InformationalVersion>
     <OutputType>Library</OutputType>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
   </PropertyGroup>
+
+  <!--
+    Developer Diagnostics canonical build boundary.
+    - Normal development builds default to ON.
+    - General/public release builds must explicitly pass:
+        /p:AIrConDeveloperDiagnostics=false
+    - Diagnostic-only logging, measurement and permissions must stay behind
+      AIRCON_DEVELOPER_DIAGNOSTICS so OFF builds do not execute diagnostic work.
+    - Product behavior must not depend on this boundary.
+    Keep this as the single Developer Diagnostics authority; do not add parallel flags.
+  -->
+  <PropertyGroup>
+    <AIrConDeveloperDiagnostics Condition="'$(AIrConDeveloperDiagnostics)' == ''">false</AIrConDeveloperDiagnostics>
+    <DefineConstants Condition="'$(AIrConDeveloperDiagnostics)' == 'true'">$(DefineConstants);AIRCON_DEVELOPER_DIAGNOSTICS</DefineConstants>
+  </PropertyGroup>
+
   <PropertyGroup Condition="'$(Platform)'=='x86'">
     <PlatformTarget>x86</PlatformTarget>
   </PropertyGroup>
