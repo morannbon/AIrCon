@@ -12,7 +12,7 @@ namespace AIrCon.BasicPlugin;
 /// </summary>
 internal sealed class AIrConRenderer
 {
-    internal const string PluginVersion = "1.0.4";
+    internal const string PluginVersion = "1.0.5";
     internal const string PluginListTitle = "AIrCon";
     internal static string PluginToolWindowTitle => $"{PluginListTitle} {PluginVersion}";
     internal const string PluginId = "aircon.basic";
@@ -46,7 +46,9 @@ internal sealed class AIrConRenderer
     internal const int DefaultZappingIntervalSeconds = 60;
 
     // Tool-window layout metrics are centralized here.
-    // WinForms WebBrowser fallback is IE-like, so CSS custom properties / flex / sticky / 100vh are avoided intentionally.
+    // The WinForms WebBrowser fallback is IE-like. Use only layout features already validated in this host;
+    // semantic color tokens are resolved before delivery, and flex is limited to the established toolbar/status/marquee regions.
+    // Avoid introducing unvalidated browser-dependent layout such as sticky positioning or 100vh sizing.
     // Do not scatter toolbar/list pixel values in CSS strings. Derived values must come from this metric contract.
     // Toolbar wave buttons are text selectors; action buttons are compact symbolic square buttons.
     // Symbol sizing is derived from the toolbar button metric contract and is not an ad hoc icon reserve.
@@ -599,7 +601,7 @@ internal sealed class AIrConRenderer
             var powerOffDeadline = ResolvePowerOffDeadline(selectedViewerProfile.Value);
             var data = CaptureData(filter, viewerProfiles, focusTriplet);
             #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog($"RenderHtml route=aircon mode=viewer_1_0_4 toolWindow={isToolWindow} requestedWave={requestedWave} effectiveWave={filter} viewerProfile={selectedViewerProfile.Value} selectorVisible={viewerProfiles.SelectorVisibleRecommended} profiles={viewerProfiles.SelectableProfiles.Count} services={data.Services.Count} viewers={data.ViewerSessions.Count} activeViewers={data.ViewerSessions.Count(x => x.IsActive)} highlighted={data.Services.Count(x => x.IsViewing)} projectionUsed={data.ProjectionUsed}");
+            SafeLog($"RenderHtml route=aircon mode=viewer_1_0_5 toolWindow={isToolWindow} requestedWave={requestedWave} effectiveWave={filter} viewerProfile={selectedViewerProfile.Value} selectorVisible={viewerProfiles.SelectorVisibleRecommended} profiles={viewerProfiles.SelectableProfiles.Count} services={data.Services.Count} viewers={data.ViewerSessions.Count} activeViewers={data.ViewerSessions.Count(x => x.IsActive)} highlighted={data.Services.Count(x => x.IsViewing)} projectionUsed={data.ProjectionUsed}");
             #endif
             #if AIRCON_DEVELOPER_DIAGNOSTICS
             if (zappingActive) SafeLog($"ZAPPING_STATE active windowId={windowIdForWave} activeWave={activeZappingWave} displayedWave={filter} viewerProfile={selectedViewerProfile.Value} services={data.Services.Count} intervalSeconds={activeZappingState!.IntervalSeconds}");
@@ -612,7 +614,11 @@ internal sealed class AIrConRenderer
                 ? BuildFloatingViewerHtml(context, data, action, window, filter, selectedTunerValue, selectedViewerProfile, alwaysOnTop, zappingActive, activeZappingWave, powerOffDeadline)
                 : BuildLauncherHtml(context, data, window, filter, selectedTunerValue, selectedViewerProfile.Value, alwaysOnTop);
         }
+#if AIRCON_DEVELOPER_DIAGNOSTICS
         catch (Exception ex)
+#else
+        catch (Exception)
+#endif
         {
             #if AIRCON_DEVELOPER_DIAGNOSTICS
             SafeLog("RenderHtml failed: " + ex.GetType().Name + " " + ex.Message);
@@ -921,7 +927,11 @@ internal sealed class AIrConRenderer
             }
             return new ZappingTickResult(result.Success, result.Success ? "zapping_tick_ok" : "zapping_tick_failed");
         }
+#if AIRCON_DEVELOPER_DIAGNOSTICS
         catch (Exception ex)
+#else
+        catch (Exception)
+#endif
         {
             RemoveZappingState(viewerProfile);
             #if AIRCON_DEVELOPER_DIAGNOSTICS
@@ -1288,7 +1298,11 @@ internal sealed class AIrConRenderer
                 .OrderByDescending(x => x.Current)
                 .FirstOrDefault();
         }
+#if AIRCON_DEVELOPER_DIAGNOSTICS
         catch (Exception ex)
+#else
+        catch (Exception)
+#endif
         {
             #if AIRCON_DEVELOPER_DIAGNOSTICS
             SafeLog($"VIEWER_SESSION_LOOKUP failed viewerProfile={viewerProfile} exception={ex.GetType().Name} message={ex.Message}");
@@ -1676,7 +1690,11 @@ internal sealed class AIrConRenderer
             #endif
             return ViewerProfileState.Unavailable;
         }
+#if AIRCON_DEVELOPER_DIAGNOSTICS
         catch (Exception ex)
+#else
+        catch (Exception)
+#endif
         {
             #if AIRCON_DEVELOPER_DIAGNOSTICS
             SafeLog("VIEWER_PROFILE_SELECTOR exception=" + ex.GetType().Name + " " + ex.Message);
@@ -2384,6 +2402,57 @@ services = NormalizeViewerServiceAuthority(services, diagnostics);
     }
     var menu=document.getElementById('aircon-reservation-menu');
     if(!list||!menu)return;
+    var marqueeDelayMs=400,marqueeSpeedPxPerSec=54;
+    var marqueeDelay=0,marqueeFrame=0,marqueeTarget=null,marqueeStart=0;
+    function clearMarquee(target){
+      var owns=!target||target===marqueeTarget;
+      if(owns){
+        if(marqueeDelay){window.clearTimeout(marqueeDelay);marqueeDelay=0;}
+        if(marqueeFrame){window.cancelAnimationFrame(marqueeFrame);marqueeFrame=0;}
+      }
+      var el=target||(owns?marqueeTarget:null);
+      if(el){var track=el.querySelector('.aircon-current-track');if(track)track.style.transform='translateX(0px)';el.classList.remove('aircon-current-marquee');var copy=el.querySelector('.aircon-current-copy');if(copy)copy.style.marginLeft='';}
+      if(owns)marqueeTarget=null;
+    }
+    function measureMarquee(el){
+      var text=el&&el.querySelector('.aircon-current-text');
+      if(!text)return null;
+      var available=el.clientWidth,textWidth=text.scrollWidth;
+      if(available<=0||textWidth<=available+1)return null;
+      return {available:available,textWidth:textWidth,gap:Math.max(28,Math.floor(available/3))};
+    }
+    function marqueeTick(now){
+      var el=marqueeTarget;if(!el)return;
+      var m=measureMarquee(el);if(!m){clearMarquee();return;}
+      var track=el.querySelector('.aircon-current-track');if(!track){clearMarquee();return;}
+      var travel=Math.max(1,m.textWidth+m.gap);
+      var phase=((now-marqueeStart)*marqueeSpeedPxPerSec/1000)%travel;
+      track.style.transform='translateX('+(-phase)+'px)';
+      marqueeFrame=window.requestAnimationFrame(marqueeTick);
+    }
+    function startMarquee(el){
+      clearMarquee();
+      var m=measureMarquee(el);if(!m)return;
+      marqueeTarget=el;
+      marqueeDelay=window.setTimeout(function(){
+        marqueeDelay=0;if(marqueeTarget!==el)return;
+        var latest=measureMarquee(el);if(!latest){clearMarquee();return;}
+        var copy=el.querySelector('.aircon-current-copy');if(copy)copy.style.marginLeft=latest.gap+'px';
+        el.classList.add('aircon-current-marquee');
+        marqueeStart=window.performance&&window.performance.now?window.performance.now():Date.now();
+        marqueeFrame=window.requestAnimationFrame(marqueeTick);
+      },marqueeDelayMs);
+    }
+    var marqueeItems=list.querySelectorAll('.aircon-current[data-aircon-marquee=\"true\"]');
+    for(var mi=0;mi<marqueeItems.length;mi++){
+      (function(el){el.addEventListener('mouseenter',function(){startMarquee(el);});el.addEventListener('mouseleave',function(){clearMarquee(el);});})(marqueeItems[mi]);
+    }
+    window.addEventListener('resize',function(){
+      if(!marqueeTarget)return;
+      var el=marqueeTarget;var latest=measureMarquee(el);
+      if(!latest){clearMarquee();return;}
+      var copy=el.querySelector('.aircon-current-copy');if(copy)copy.style.marginLeft=latest.gap+'px';
+    });
     function closeMenu(){menu.style.display='none';var sections=menu.getElementsByClassName('aircon-reservation-section');for(var i=0;i<sections.length;i++)sections[i].style.display='none';}
     list.oncontextmenu=function(ev){
       ev=ev||window.event;var el=ev.target||ev.srcElement;
@@ -2402,7 +2471,7 @@ services = NormalizeViewerServiceAuthority(services, diagnostics);
     };
     document.onclick=function(ev){var t=(ev||window.event).target||window.event.srcElement;if(menu.style.display==='block'&&!menu.contains(t))closeMenu();};
     document.onkeydown=function(ev){ev=ev||window.event;if(ev.keyCode===27)closeMenu();};
-    list.onscroll=closeMenu;
+    list.onscroll=function(){closeMenu();clearMarquee();};
   })();
   </script>
 </div>
@@ -2501,6 +2570,9 @@ body.aircon-runtime-root{position:static;}
 .aircon-time-start{color:var(--aircon-time-start);}
 .aircon-time-end{color:var(--aircon-time-end);}
 .aircon-current{position:absolute;left:{{8 + serviceWidth + timeWidth}}px;right:8px;top:0;display:block;width:auto;margin:0;height:{{rowHeight}}px;line-height:{{rowHeight}}px;vertical-align:top;color:var(--aircon-text);font-size:12px;font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:clip;}
+.aircon-current-track{display:inline-flex;align-items:center;height:100%;line-height:inherit;white-space:nowrap;will-change:transform;transform:translateX(0);}
+.aircon-current-copy{display:none;}
+.aircon-current-marquee .aircon-current-copy{display:inline-block;}
 .aircon-float [hidden]{display:none;}
 .aircon-scroll-anchor{display:block;width:100%;height:1px;line-height:1px;font-size:0;overflow:hidden;margin:0;padding:0;}
 .aircon-zapping-bar{display:flex;position:relative;align-items:center;justify-content:space-between;gap:8px;min-width:0;margin:0;padding:5px 8px;border-top:1px solid var(--aircon-border);background:var(--aircon-subtle);white-space:nowrap;overflow:hidden;box-sizing:border-box;}
@@ -2795,7 +2867,7 @@ body.aircon-runtime-root{position:static;}
         var title = hasTriplet ? "ダブルクリックで視聴 / 右クリックで視聴予約" : "このチャンネルは現在視聴できません";
         var current = string.IsNullOrWhiteSpace(row.CurrentTitle) ? "番組情報取得中" : row.CurrentTitle;
         var currentClass = "aircon-current";
-        var currentTitleAttr = " title=\"" + HtmlAttr(current) + "\"";
+        var currentTitleAttr = " title=\"\" aria-label=\"" + HtmlAttr(current) + "\" data-aircon-marquee=\"true\"";
         var serviceDomId = hasTriplet ? BuildServiceDomId(row) : string.Empty;
         var rowId = hasTriplet
             ? " id=\"" + HtmlAttr(isSelectedProfileViewing ? CurrentViewingAnchorId : serviceDomId) + "\""
@@ -2804,7 +2876,7 @@ body.aircon-runtime-root{position:static;}
         var content =
             $"<span class=\"aircon-service\">{Html(row.ServiceName)}</span>" +
             BuildCurrentTimeHtml(row) +
-            $"<span class=\"{currentClass}\"{currentTitleAttr}>{Html(current)}</span>";
+            $"<span class=\"{currentClass}\"{currentTitleAttr}><span class=\"aircon-current-track\"><span class=\"aircon-current-text\">{Html(current)}</span><span class=\"aircon-current-copy\" aria-hidden=\"true\">{Html(current)}</span></span></span>";
 
         if (!hasTriplet)
         {
@@ -3460,11 +3532,9 @@ body.aircon-runtime-root{position:static;}
     private static string FirstNonEmpty(params string?[] values) => values.FirstOrDefault(x => !string.IsNullOrWhiteSpace(x))?.Trim() ?? string.Empty;
     private static string Html(string? value) => WebUtility.HtmlEncode(value ?? string.Empty);
     private static string HtmlAttr(string? value) => Html(value).Replace("\"", "&quot;");
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-
-    // Developer Diagnostics canonical boundary. Calls to this method are removed by the compiler
-    // when AIRCON_DEVELOPER_DIAGNOSTICS is not defined (Public build), including argument evaluation.
-    // Public builds therefore do not construct or emit these diagnostic messages.
+    // Developer Diagnostics canonical boundary. The method remains present in every build so
+    // Diagnostics OFF never creates caller/reference breakage. Conditional removes the calls
+    // (including argument evaluation), and the body has no public-build side effects.
     [System.Diagnostics.Conditional("AIRCON_DEVELOPER_DIAGNOSTICS")]
     private void SafeLog(string message)
     {
@@ -3472,7 +3542,6 @@ body.aircon-runtime-root{position:static;}
         try { AIrConNewApiBridge.LogInfo("AIrCon: " + message); } catch { }
 #endif
     }
-#endif
 
     private sealed record ViewerSessionContractState(string ViewerSessionId, long Generation);
     private sealed record ZappingState(bool Active, DateTimeOffset StartedAt, DateTimeOffset LastTickAt, DateTimeOffset NextTickAt, string LastServiceKey, string WindowId, string Wave, string ViewerProfile, long Generation, string ViewerSessionId, long ViewerGeneration, int ProcessId, int IntervalSeconds);
@@ -3781,10 +3850,9 @@ internal static class AIrConNewApiBridge
         _programProjectionTo = default;
         _programProjectionExpiresAt = default;
     }
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-
-    // Developer-only log sink. In Public builds callers are compiled out and the sink body itself
-    // is excluded, so no Runtime Logs.Write path remains executable from AIrCon.
+    // Developer-only log sink. Keep the symbol available in every build so Diagnostics OFF
+    // cannot break unguarded call sites; Conditional removes those calls and the body compiles
+    // to a side-effect-free no-op when AIRCON_DEVELOPER_DIAGNOSTICS is not defined.
     [System.Diagnostics.Conditional("AIRCON_DEVELOPER_DIAGNOSTICS")]
     internal static void LogInfo(string message)
     {
@@ -3797,7 +3865,6 @@ internal static class AIrConNewApiBridge
         }
 #endif
     }
-#endif
 
     internal static AirConSettings LoadSettings()
     {
