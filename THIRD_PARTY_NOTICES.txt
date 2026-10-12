@@ -1,0 +1,9 @@
+AIrCon v1.0.6 - Third-party notices
+
+TvAIr Plugin SDK 1.1.14 (Host Contract 1.1.14)
+Directory: TvAIrPlugin/
+Source: TvAIr Project, https://github.com/morannbon/TvAIr
+
+The SDK source is part of the TvAIr Project and is governed by the applicable rights and conditions of its copyright holder. The TvAIr Project LICENSE is included at the distribution root. The SDK is included to build AIrCon, not relicensed independently by the AIrCon plugin.
+
+No external third-party binary package is bundled in this source ZIP.

@@ -4,7 +4,7 @@ param(
     [string]$SourceRoot='.'
 )
 $ErrorActionPreference='Stop'
-$spec=ConvertFrom-Json '{"Docs":["README.md","README.txt"],"Version":"1.0.5","Host":"1.2.1","Dll":"AIrCon.BasicPlugin.dll","Project":"AIrCon.BasicPlugin","Framework":"","Solution":"AIrCon.sln","Name":"AIrCon"}'
+$spec=ConvertFrom-Json '{"Docs":["README.md","README.txt","LICENSE","THIRD_PARTY_NOTICES.txt"],"Version":"1.0.6","Host":"1.2.8","Dll":"AIrCon.BasicPlugin.dll","Project":"AIrCon.BasicPlugin","Framework":"","Solution":"AIrCon.sln","Name":"AIrCon"}'
 $root=(Resolve-Path -LiteralPath $SourceRoot).Path
 [xml]$project=Get-Content -LiteralPath (Join-Path $root "$($spec.Project)/$($spec.Project).csproj")
 if($spec.Name -eq 'AI-rhythm') {
@@ -22,7 +22,7 @@ if(Test-Path -LiteralPath $out){throw 'Package staging already exists. Use a cle
 New-Item -ItemType Directory -Path $out -Force | Out-Null
 Copy-Item -LiteralPath $dll -Destination $out
 foreach($doc in $spec.Docs){Copy-Item -LiteralPath (Join-Path $root $doc) -Destination $out}
-if($spec.Name -in @('AI-rhythm','AIrCon')) {
+if($spec.Name -eq 'AI-rhythm') {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'SDK_LICENSE.txt') -Destination $out
 }
 $deploy=$spec.Dll

@@ -1,23 +1,16 @@
-﻿<Project>
+<Project>
   <PropertyGroup>
-    <TvAIrProductVersion>1.2.1</TvAIrProductVersion>
-    <TvAIrFileVersion>1.2.1.0</TvAIrFileVersion>
-    <TvAIrAssemblyVersion>1.2.1.0</TvAIrAssemblyVersion>
-    <TvAIrPluginSdkVersion>1.1.7</TvAIrPluginSdkVersion>
+    <TvAIrProductVersion>1.2.8</TvAIrProductVersion>
+    <TvAIrFileVersion>1.2.8.0</TvAIrFileVersion>
+    <TvAIrAssemblyVersion>1.2.8.0</TvAIrAssemblyVersion>
+    <TvAIrPluginSdkVersion>1.1.14</TvAIrPluginSdkVersion>
     <TvAIrPluginSdkAssemblyVersion>1.0.0.0</TvAIrPluginSdkAssemblyVersion>
-    <TvAIrPluginHostContractVersion>1.1.7</TvAIrPluginHostContractVersion>
+    <TvAIrPluginHostContractVersion>1.1.14</TvAIrPluginHostContractVersion>
     <TvAIrPublicContractName>release_contract</TvAIrPublicContractName>
     <TvAIrPluginHostContractName>plugin-host-foundation</TvAIrPluginHostContractName>
     <TvAIrPluginCompatibilityMajor>1</TvAIrPluginCompatibilityMajor>
     <TvAIrMinimumSupportedPluginHostContractVersion>1.0.0</TvAIrMinimumSupportedPluginHostContractVersion>
-    <!--
-      Developer Diagnostics canonical build boundary:
-      - This public-release source defaults to OFF.
-      - Development builds may explicitly pass /p:TvAIrDeveloperDiagnostics=true.
-      - OFF means no developer-log generation/retention/exposure and no diagnostic-only side work.
-      - User operational logs are a separate responsibility and remain enabled.
-      - Do not reintroduce per-log release-time deletion or runtime diagnostic flags.
-    -->
+    <!-- Developer Diagnostics build boundary. Public distribution defaults diagnostics OFF; development builds can explicitly enable them. User operational logs remain enabled. -->
     <TvAIrDeveloperDiagnostics Condition="'$(TvAIrDeveloperDiagnostics)' == ''">false</TvAIrDeveloperDiagnostics>
     <DefineConstants Condition="'$(TvAIrDeveloperDiagnostics)' == 'true'">$(DefineConstants);TVAIR_DEVELOPER_DIAGNOSTICS</DefineConstants>
   </PropertyGroup>

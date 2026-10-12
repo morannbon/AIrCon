@@ -1,4 +1,4 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 using System.Net;
 using TvAIrPlugin;
 using TvAIrPlugin.Runtime;
@@ -12,7 +12,7 @@ namespace AIrCon.BasicPlugin;
 /// </summary>
 internal sealed class AIrConRenderer
 {
-    internal const string PluginVersion = "1.0.5";
+    internal const string PluginVersion = "1.0.6";
     internal const string PluginListTitle = "AIrCon";
     internal static string PluginToolWindowTitle => $"{PluginListTitle} {PluginVersion}";
     internal const string PluginId = "aircon.basic";
@@ -1292,7 +1292,7 @@ internal sealed class AIrConRenderer
     {
         try
         {
-            return CaptureViewerSessionsNewApi(new List<string>())
+            return CaptureViewerSessionsNewApi()
                 .Where(x => x.ViewerProfile.Equals(viewerProfile, StringComparison.OrdinalIgnoreCase))
                 .Where(x => x.IsActive && !string.IsNullOrWhiteSpace(x.ViewerSessionId))
                 .OrderByDescending(x => x.Current)
@@ -1744,13 +1744,14 @@ internal sealed class AIrConRenderer
         if (text == "地上波" || text == "TERRESTRIAL" || text == "GROUND") return "GR";
         if (text == "BS" || text == "CS" || text == "BS/CS" || text == "BSCS" || text == "BS-CS") return "BSCS";
         if (text == "GR") return "GR";
+        if (text is "CATV" or "ISDB-C" or "CABLE") return "CATV";
         return text;
     }
 
     private static string RequiredProfileGroupForWave(string wave)
     {
         var normalized = NormalizeWaveFilter(wave);
-        return normalized.Equals("GR", StringComparison.OrdinalIgnoreCase) ? "GR" : "BSCS";
+        return normalized.Equals("GR", StringComparison.OrdinalIgnoreCase) ? "GR" : normalized.Equals("CATV", StringComparison.OrdinalIgnoreCase) ? "CATV" : "BSCS";
     }
 
     private static bool IsAutoProfileId(string id)
@@ -1771,7 +1772,7 @@ internal sealed class AIrConRenderer
         var exact = available.FirstOrDefault(x => x.Id.Equals(desired, StringComparison.OrdinalIgnoreCase));
         if (exact != null) return exact;
 
-        return available.FirstOrDefault() ?? selectable.FirstOrDefault() ?? state.SelectableProfiles.FirstOrDefault() ?? ViewerProfileChoice.Unavailable;
+        return available.FirstOrDefault() ?? (NormalizeWaveFilter(wave) == "CATV" ? ViewerProfileChoice.Unavailable : selectable.FirstOrDefault() ?? state.SelectableProfiles.FirstOrDefault() ?? ViewerProfileChoice.Unavailable);
     }
 
     private static ServiceRow FromRuntimeService(TvAirServiceDto service, int index)
@@ -1782,8 +1783,8 @@ internal sealed class AIrConRenderer
             ProgramGuideOrder = service.DisplayOrder != 0 ? service.DisplayOrder : index,
             ProgramGuideFilterGroup = filter,
             ProgramGuideFilterLabel = FilterLabel(filter),
-            AllocationGroup = filter == "GR" ? "GR" : "BSCS",
-            TunerGroup = filter == "GR" ? "GR" : "BSCS",
+            AllocationGroup = filter == "GR" ? "GR" : filter == "CATV" ? "CATV" : "BSCS",
+            TunerGroup = filter == "GR" ? "GR" : filter == "CATV" ? "CATV" : "BSCS",
             ServiceName = service.ServiceName,
             NetworkId = service.NetworkId,
             TransportStreamId = service.TransportStreamId,
@@ -1795,6 +1796,7 @@ internal sealed class AIrConRenderer
     {
         var text = (value ?? string.Empty).Trim().ToUpperInvariant();
         if (text is "GR" or "TERRESTRIAL" or "地上波" or "地デジ") return "GR";
+        if (text is "CATV" or "ISDB-C" or "CABLE") return "CATV";
         if (text.StartsWith("CS", StringComparison.Ordinal)) return "CS";
         if (text is "BS" or "BSCS" or "SATELLITE" or "BS/CS") return "BS";
         return text;
@@ -1802,14 +1804,13 @@ internal sealed class AIrConRenderer
 
     private List<ServiceRow> CaptureServiceProjection(string filter)
     {
-        var diagnostics = new List<string>();
         var services = AIrConNewApiBridge.ListServices()
             .Where(x => x.IsEnabled)
             .OrderBy(x => x.DisplayOrder)
             .ThenBy(x => x.ServiceName, StringComparer.OrdinalIgnoreCase)
             .Select((x, index) => FromRuntimeService(x, index))
             .ToList();
-        services = NormalizeViewerServiceAuthority(services, diagnostics);
+        services = NormalizeViewerServiceAuthority(services);
         return services
             .Where(x => x.ProgramGuideFilterGroup.Equals(filter, StringComparison.OrdinalIgnoreCase))
             .OrderBy(x => x.ProgramGuideOrder)
@@ -1824,7 +1825,6 @@ internal sealed class AIrConRenderer
         var waveFilters = new List<WaveFilterRow>();
         var programEvents = new List<TvAirProgramEventDto>();
         var viewerReservations = new List<TvAirViewerReservation>();
-        var diagnostics = new List<string>();
         var projectionUsed = false;
         var safeEventContractAvailable = false;
         var safeDblclickEvents = false;
@@ -1839,7 +1839,9 @@ internal sealed class AIrConRenderer
                 .ThenBy(x => x.ServiceName, StringComparer.OrdinalIgnoreCase)
                 .Select((x, index) => FromRuntimeService(x, index))
                 .ToList();
-            diagnostics.Add("viewerControlChannels=Runtime count=" + services.Count + " source=runtime_channels");
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog("viewerControlChannels=Runtime count=" + services.Count + " source=runtime_channels");
+#endif
 
             waveFilters = AIrConNewApiBridge.ListWaveFilters()
                 .Where(x => x.IsProgramGuideFilter)
@@ -1847,42 +1849,56 @@ internal sealed class AIrConRenderer
                 .Select(x => new WaveFilterRow(FirstNonEmpty(x.Key, x.BroadcastType), FirstNonEmpty(x.BroadcastType, x.Key), FirstNonEmpty(x.Label, x.BroadcastType, x.Key)))
                 .Where(x => !string.IsNullOrWhiteSpace(x.Group))
                 .ToList();
-            diagnostics.Add("waveFilters=Runtime count=" + waveFilters.Count);
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog("waveFilters=Runtime count=" + waveFilters.Count);
+#endif
 
             var now = DateTimeOffset.Now;
             programEvents = AIrConNewApiBridge.ListProgramEvents(now, now.AddHours(6)).ToList();
-            var applied = ApplyRuntimeNowNext(services, programEvents, now);
+            ApplyRuntimeNowNext(services, programEvents, now);
             projectionUsed = true;
-            diagnostics.Add("programGuide=Runtime overlayNowNext=" + applied + " events=" + programEvents.Count + " listAuthority=runtime_channels");
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog("programGuide=Runtime events=" + programEvents.Count + " listAuthority=runtime_channels");
+#endif
         }
-        catch (Exception ex)
-        {
-            diagnostics.Add("runtimeProjection exception=" + ex.Message);
-        }
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+        catch (Exception ex) { SafeLog("runtimeProjection exception=" + ex.Message); }
+#else
+        catch (Exception) { }
+#endif
 
         try
         {
             viewerReservations = AIrConNewApiBridge.ListViewerReservations().Where(x => x.State.Equals("Scheduled", StringComparison.OrdinalIgnoreCase)).ToList();
-            diagnostics.Add("viewerReservations=Runtime scheduled=" + viewerReservations.Count);
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog("viewerReservations=Runtime scheduled=" + viewerReservations.Count);
+#endif
         }
-        catch (Exception ex) { diagnostics.Add("viewerReservations exception=" + ex.Message); }
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+        catch (Exception ex) { SafeLog("viewerReservations exception=" + ex.Message); }
+#else
+        catch (Exception) { }
+#endif
 
         try
         {
-            sessions = CaptureViewerSessionsNewApi(diagnostics);
-            diagnostics.Add("viewerSessions=Runtime count=" + sessions.Count + " source=runtime_viewer_sessions");
+            sessions = CaptureViewerSessionsNewApi();
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+            SafeLog("viewerSessions=Runtime count=" + sessions.Count + " source=runtime_viewer_sessions");
+#endif
         }
-        catch (Exception ex) { diagnostics.Add("viewerSessions exception=" + ex.Message); }
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+        catch (Exception ex) { SafeLog("viewerSessions exception=" + ex.Message); }
+#else
+        catch (Exception) { }
+#endif
 
-services = NormalizeViewerServiceAuthority(services, diagnostics);
+services = NormalizeViewerServiceAuthority(services);
 
+#if AIRCON_DEVELOPER_DIAGNOSTICS
         var zeroTripletFinal = services.Count(x => x.NetworkId <= 0 || x.TransportStreamId <= 0 || x.ServiceId <= 0);
-        if (zeroTripletFinal > 0)
-        {
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog("TRIPLET_DIAG finalZero=" + zeroTripletFinal);
-            #endif
-        }
+        if (zeroTripletFinal > 0) SafeLog("TRIPLET_DIAG finalZero=" + zeroTripletFinal);
+#endif
 
         if (waveFilters.Count == 0)
         {
@@ -1890,6 +1906,13 @@ services = NormalizeViewerServiceAuthority(services, diagnostics);
             waveFilters.Add(new WaveFilterRow("BS", "BS", "BS"));
             waveFilters.Add(new WaveFilterRow("CS", "CS", "CS"));
         }
+        // CATV belongs only to a Host-advertised CATV viewing profile; it is never
+        // inferred from a GR/BS/CS HYBRID profile or from the service NID.
+        if (viewerProfiles.AvailableForWave("CATV").Any() && services.Any(x => x.ProgramGuideFilterGroup == "CATV")
+            && !waveFilters.Any(x => NormalizeWaveFilter(x.Group) == "CATV"))
+            waveFilters.Add(new WaveFilterRow("CATV", "CATV", "CATV"));
+        if (!viewerProfiles.AvailableForWave("CATV").Any())
+            waveFilters.RemoveAll(x => NormalizeWaveFilter(x.Group) == "CATV");
 
         if (services.Count > 0 && sessions.Count > 0)
         {
@@ -1906,8 +1929,10 @@ services = NormalizeViewerServiceAuthority(services, diagnostics);
             }
         }
 
+#if AIRCON_DEVELOPER_DIAGNOSTICS
         var sessionHighlighted = services.Count(x => x.IsViewing);
-        diagnostics.Add("currentRowHighlight source=viewer_session session=" + sessionHighlighted + " focusOverride=disabled");
+        SafeLog("currentRowHighlight source=viewer_session session=" + sessionHighlighted + " focusOverride=disabled");
+#endif
 
         var filtered = services
             .Where(x => x.ProgramGuideFilterGroup.Equals(filter, StringComparison.OrdinalIgnoreCase))
@@ -1923,45 +1948,53 @@ services = NormalizeViewerServiceAuthority(services, diagnostics);
 
         var serviceColumnWidth = CalculateServiceColumnWidth(services);
 
-        return new FloatingViewerData(filtered, sessions, tuners, waveFilters, viewerProfiles, programEvents, viewerReservations, diagnostics, projectionUsed, safeEventContractAvailable, safeDblclickEvents, serviceColumnWidth);
+        return new FloatingViewerData(filtered, sessions, tuners, waveFilters, viewerProfiles, programEvents, viewerReservations, projectionUsed, safeEventContractAvailable, safeDblclickEvents, serviceColumnWidth);
     }
 
-    private static List<ServiceRow> NormalizeViewerServiceAuthority(IReadOnlyList<ServiceRow> source, List<string> diagnostics)
+    private static List<ServiceRow> NormalizeViewerServiceAuthority(IReadOnlyList<ServiceRow> source)
     {
         // AIrCon の局行は「視聴開始できる triplet 行」を正本にする。
         // ProgramGuide/NowNext は番組名と時刻の overlay 専用で、局行の採否には使わない。
         // ここでだけ invalid/duplicate を落とし、HTML/CSS 側で隠す後段処理は作らない。
         var normalized = new List<ServiceRow>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+#if AIRCON_DEVELOPER_DIAGNOSTICS
         var invalid = 0;
         var duplicate = 0;
+#endif
 
         foreach (var row in source.OrderBy(x => x.ProgramGuideOrder).ThenBy(x => x.ServiceName, StringComparer.OrdinalIgnoreCase))
         {
             if (!HasResolvedTriplet(row))
             {
+#if AIRCON_DEVELOPER_DIAGNOSTICS
                 invalid++;
+#endif
                 continue;
             }
 
             var key = ServiceKey(row.NetworkId, row.TransportStreamId, row.ServiceId);
             if (!seen.Add(key))
             {
+#if AIRCON_DEVELOPER_DIAGNOSTICS
                 duplicate++;
+#endif
                 continue;
             }
 
             normalized.Add(row);
         }
 
-        diagnostics.Add("serviceAuthority=viewer_start_triplet rows=" + normalized.Count
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+        AIrConNewApiBridge.LogInfo("AIrCon: serviceAuthority=viewer_start_triplet rows=" + normalized.Count
             + " invalidDropped=" + invalid
             + " duplicateDropped=" + duplicate
             + " overlayDoesNotPrune=True");
+#endif
         return normalized;
     }
 
-    private static List<ViewerSessionRow> CaptureViewerSessionsNewApi(List<string> diagnostics)
+    private static List<ViewerSessionRow> CaptureViewerSessionsNewApi()
     {
         try
         {
@@ -1990,20 +2023,18 @@ services = NormalizeViewerServiceAuthority(services, diagnostics);
                 .ThenByDescending(x => x.IsActive)
                 .ToList();
         }
-        catch (Exception ex)
+        catch (Exception)
         {
-            diagnostics.Add("viewerSessionsRuntime exception=" + ex.Message);
             return new List<ViewerSessionRow>();
         }
     }
 
-    private static int ApplyRuntimeNowNext(List<ServiceRow> services, IReadOnlyList<TvAirProgramEventDto> events, DateTimeOffset now)
+    private static void ApplyRuntimeNowNext(List<ServiceRow> services, IReadOnlyList<TvAirProgramEventDto> events, DateTimeOffset now)
     {
         var byService = events
             .Where(x => x.Start <= now && x.End > now)
             .GroupBy(x => ServiceKey(x.NetworkId, x.TransportStreamId, x.ServiceId), StringComparer.OrdinalIgnoreCase)
             .ToDictionary(x => x.Key, x => x.OrderByDescending(e => e.Start).First(), StringComparer.OrdinalIgnoreCase);
-        var applied = 0;
         foreach (var row in services)
         {
             if (!byService.TryGetValue(ServiceKey(row.NetworkId, row.TransportStreamId, row.ServiceId), out var current)) continue;
@@ -2011,9 +2042,7 @@ services = NormalizeViewerServiceAuthority(services, diagnostics);
             row.CurrentStart = current.Start;
             row.CurrentEnd = current.End;
             row.HasCurrentProgramProjection = true;
-            applied++;
         }
-        return applied;
     }
 
     private ViewerOperation CaptureAction(RuntimeUiRenderContext c)
@@ -2505,10 +2534,10 @@ services = NormalizeViewerServiceAuthority(services, diagnostics);
         var timeWidth = ToolWindowTimeColumnWidthPx;
         
         return ResolveThemePalette(context).Apply($$"""
-html,body{margin:0;padding:0;width:100%;height:100%;min-width:{{ToolWindowMinimumWidthPx}}px;min-height:{{ToolWindowMinimumHeightPx}}px;background:var(--aircon-page);color:var(--aircon-text);font-family:Meiryo,"Yu Gothic",Arial,sans-serif;font-size:12px;overflow:hidden;}
+html,body{margin:0;padding:0;width:100%;height:100%;min-width:0;min-height:{{ToolWindowMinimumHeightPx}}px;background:var(--aircon-page);color:var(--aircon-text);font-family:Meiryo,"Yu Gothic",Arial,sans-serif;font-size:12px;overflow:hidden;}
 body.aircon-runtime-root{position:static;}
 .aircon-runtime-root,.aircon-runtime-root *{box-sizing:border-box;}
-.aircon-float{position:static;width:100%;height:100%;min-width:{{ToolWindowMinimumWidthPx}}px;min-height:{{ToolWindowMinimumHeightPx}}px;background:var(--aircon-page);overflow:hidden;}
+.aircon-float{position:static;width:100%;height:100%;min-width:0;min-height:{{ToolWindowMinimumHeightPx}}px;background:var(--aircon-page);overflow:hidden;}
 .aircon-toolbar{position:fixed;left:0;right:0;top:0;height:{{toolbarHeight}}px;padding:0;border-bottom:{{ToolWindowToolbarSeparatorPx}}px solid var(--aircon-border);background:var(--aircon-surface);white-space:nowrap;overflow:hidden;text-align:left;z-index:2;}
 .aircon-toolbar-inner{position:absolute;left:{{toolbarPaddingX}}px;right:{{toolbarPaddingX}}px;top:{{toolbarContentTop}}px;height:{{buttonHeight}}px;overflow:hidden;white-space:nowrap;}
 .aircon-toolbar-wave-area{position:absolute;left:0;top:0;width:{{waveAreaWidth}}px;height:{{cellHeight}}px;line-height:{{cellHeight}}px;white-space:nowrap;overflow:hidden;}
@@ -2533,6 +2562,8 @@ body.aircon-runtime-root{position:static;}
 .aircon-profile-button-on:hover,.aircon-profile-button-on:focus,.aircon-profile-button-on:active{background:var(--aircon-accent);color:var(--aircon-accent-text);border-color:var(--aircon-button-border);}
 .aircon-profile-button-disabled{opacity:.45;cursor:default;background:var(--aircon-disabled-bg);color:var(--aircon-disabled-text);}
 .aircon-toolbar-button-disabled{opacity:.70;cursor:default;background:var(--aircon-disabled-bg);color:var(--aircon-disabled-text);}
+.aircon-toolbar-wave-area.aircon-wave-four .aircon-wave-group{width:153px;}
+.aircon-toolbar-wave-area.aircon-wave-four .aircon-wave-button{width:39px;min-width:39px;}
 .aircon-wave-button{width:{{waveButtonWidth}}px;min-width:{{waveButtonWidth}}px;border-radius:0;background:var(--aircon-button-bg);border-color:var(--aircon-button-border);color:var(--aircon-button-text);}
 .aircon-wave-button-on{background:var(--aircon-accent);color:var(--aircon-accent-text);border-color:var(--aircon-button-border);}
 .aircon-wave-button-on:hover,.aircon-wave-button-on:focus,.aircon-wave-button-on:active{background:var(--aircon-accent);color:var(--aircon-accent-text);border-color:var(--aircon-button-border);}
@@ -2637,8 +2668,12 @@ body.aircon-runtime-root{position:static;}
         var pin = BuildPinForm(window, !alwaysOnTop, filter, selectedTuner, selectedViewerProfile.Value, alwaysOnTop);
         var settings = BuildSettingsButton(context, action, window, filter, selectedViewerProfile.Value);
 
+        // The four-wave layout must not depend on CSS :has(), which is unsupported by the Host WebBrowser fallback.
+        // The actual client width may be smaller than the Host's 360px outer-window minimum.
+        var fourWaveClass = CanonicalWaveFilters(waveFilters).Any(x => x.Group.Equals("CATV", StringComparison.OrdinalIgnoreCase))
+            ? " aircon-wave-four" : string.Empty;
         var waveGroup =
-            "<div class='aircon-toolbar-wave-area' data-role='wave-selector-group'>" +
+            "<div class='aircon-toolbar-wave-area" + fourWaveClass + "' data-role='wave-selector-group'>" +
             "<span class='aircon-toolbar-label'>放送波：</span>" +
             "<span class='aircon-wave-group' role='group' aria-label='放送波'>" + string.Join("", filterForms) + "</span>" +
             "</div>";
@@ -2711,14 +2746,15 @@ body.aircon-runtime-root{position:static;}
         var frame = profile.TvTestFrameIndex > 0
             ? profile.TvTestFrameIndex.ToString(System.Globalization.CultureInfo.InvariantCulture)
             : "?";
-        return (NormalizeWaveFilter(wave) == "GR" ? "T" : "S") + frame;
+        return (NormalizeWaveFilter(wave) == "GR" ? "T" : NormalizeWaveFilter(wave) == "CATV" ? "C" : "S") + frame;
     }
 
     private static IReadOnlyList<WaveFilterRow> CanonicalWaveFilters(IReadOnlyList<WaveFilterRow> source)
     {
         static string LabelFor(string group) => group.Equals("GR", StringComparison.OrdinalIgnoreCase) ? "地上波" : group.ToUpperInvariant();
-        return new[] { "GR", "BS", "CS" }
-            .Select(group => new WaveFilterRow(group, group, LabelFor(group)))
+        var groups = new List<string> { "GR", "BS", "CS" };
+        if (source.Any(x => NormalizeWaveFilter(x.Group) == "CATV")) groups.Add("CATV");
+        return groups.Select(group => new WaveFilterRow(group, group, LabelFor(group)))
             .ToArray();
     }
 
@@ -3257,7 +3293,7 @@ body.aircon-runtime-root{position:static;}
         string Selected(int value) => settings.ZappingIntervalSeconds == value ? " selected" : string.Empty;
         string WaveSelected(string value) => settings.StartupWave.Equals(value, StringComparison.OrdinalIgnoreCase) ? " selected" : string.Empty;
         var css = ResolveThemePalette(context).Apply(@"html,body{margin:0;width:100%;height:100%;background:var(--aircon-page);color:var(--aircon-text);font-family:Meiryo,'Yu Gothic',Arial,sans-serif;font-size:12px;overflow:hidden}.aircon-runtime-root,.aircon-runtime-root *{box-sizing:border-box}.aircon-settings{height:100%;padding:14px;background:var(--aircon-page)}.aircon-settings-title{font-size:14px;font-weight:bold;margin:0 0 14px}.aircon-settings-row{display:table;width:100%;margin:0 0 12px}.aircon-settings-label{display:table-cell;width:62%;vertical-align:middle}.aircon-settings-control{display:table-cell;text-align:right;vertical-align:middle}.aircon-settings select{width:118px;height:26px;border:1px solid var(--aircon-control-border);background:var(--aircon-input);color:var(--aircon-control-text);font-family:inherit}.aircon-toggle{width:18px;height:18px;vertical-align:middle}.aircon-settings-actions{text-align:right;margin-top:18px}.aircon-settings-button{min-width:64px;height:28px;margin-left:8px;border:1px solid var(--aircon-button-border);border-radius:3px;background:var(--aircon-button-bg);color:var(--aircon-button-text);font-family:inherit;font-weight:bold;cursor:pointer}.aircon-settings-button:hover{background:var(--aircon-button-hover)}");
-        return "<!doctype html><html><head><meta charset=\"utf-8\"><style>" + css + "</style></head><body><div class=\"aircon-settings\"><div class=\"aircon-settings-title\">AIrCon設定</div><form><div class=\"aircon-settings-row\"><div class=\"aircon-settings-label\">ウィンドウ位置とサイズを記憶する</div><div class=\"aircon-settings-control\"><input class=\"aircon-toggle\" type=\"checkbox\" name=\"rememberWindowPlacement\" value=\"true\"" + checkedAttr + "></div></div><div class=\"aircon-settings-row\"><div class=\"aircon-settings-label\">ザッピング間隔</div><div class=\"aircon-settings-control\"><select name=\"zappingIntervalSeconds\"><option value=\"30\"" + Selected(30) + ">30秒</option><option value=\"60\"" + Selected(60) + ">60秒</option><option value=\"90\"" + Selected(90) + ">90秒</option><option value=\"120\"" + Selected(120) + ">120秒</option><option value=\"180\"" + Selected(180) + ">180秒</option></select></div></div><div class=\"aircon-settings-row\"><div class=\"aircon-settings-label\">起動時に表示する放送波</div><div class=\"aircon-settings-control\"><select name=\"startupWave\"><option value=\"GR\"" + WaveSelected("GR") + ">GR</option><option value=\"BS\"" + WaveSelected("BS") + ">BS</option><option value=\"CS\"" + WaveSelected("CS") + ">CS</option></select></div></div><div class=\"aircon-settings-actions\"><button class=\"aircon-settings-button\" type=\"button\" " + closeAttrs + ">戻る</button><button class=\"aircon-settings-button\" type=\"button\" " + saveAttrs + ">保存</button></div></form></div></body></html>";
+        return "<!doctype html><html><head><meta charset=\"utf-8\"><style>" + css + "</style></head><body><div class=\"aircon-settings\"><div class=\"aircon-settings-title\">AIrCon設定</div><form><div class=\"aircon-settings-row\"><div class=\"aircon-settings-label\">ウィンドウ位置とサイズを記憶する</div><div class=\"aircon-settings-control\"><input class=\"aircon-toggle\" type=\"checkbox\" name=\"rememberWindowPlacement\" value=\"true\"" + checkedAttr + "></div></div><div class=\"aircon-settings-row\"><div class=\"aircon-settings-label\">ザッピング間隔</div><div class=\"aircon-settings-control\"><select name=\"zappingIntervalSeconds\"><option value=\"30\"" + Selected(30) + ">30秒</option><option value=\"60\"" + Selected(60) + ">60秒</option><option value=\"90\"" + Selected(90) + ">90秒</option><option value=\"120\"" + Selected(120) + ">120秒</option><option value=\"180\"" + Selected(180) + ">180秒</option></select></div></div><div class=\"aircon-settings-row\"><div class=\"aircon-settings-label\">起動時に表示する放送波</div><div class=\"aircon-settings-control\"><select name=\"startupWave\"><option value=\"GR\"" + WaveSelected("GR") + ">GR</option><option value=\"BS\"" + WaveSelected("BS") + ">BS</option><option value=\"CS\"" + WaveSelected("CS") + ">CS</option><option value=\"CATV\"" + WaveSelected("CATV") + ">CATV</option></select></div></div><div class=\"aircon-settings-actions\"><button class=\"aircon-settings-button\" type=\"button\" " + closeAttrs + ">戻る</button><button class=\"aircon-settings-button\" type=\"button\" " + saveAttrs + ">保存</button></div></form></div></body></html>";
     }
 
     private static string BuildRefreshForm(WindowOperation window, string filter, string selectedViewerProfile)
@@ -3338,7 +3374,8 @@ body.aircon-runtime-root{position:static;}
         foreach (var t in tuners.Where(x => x.IsSelectableForViewer).OrderBy(x => x.SlotIndex))
         {
             if (filter == "GR" && !t.ProgramGuideFilterGroup.Equals("GR", StringComparison.OrdinalIgnoreCase)) continue;
-            if ((filter == "BS" || filter == "CS") && t.ProgramGuideFilterGroup.Equals("GR", StringComparison.OrdinalIgnoreCase)) continue;
+            if ((filter == "BS" || filter == "CS") && (t.ProgramGuideFilterGroup.Equals("GR", StringComparison.OrdinalIgnoreCase) || t.ProgramGuideFilterGroup.Equals("CATV", StringComparison.OrdinalIgnoreCase))) continue;
+            if (filter == "CATV" && !t.ProgramGuideFilterGroup.Equals("CATV", StringComparison.OrdinalIgnoreCase)) continue;
             var value = t.Name + "|" + t.Did + "|" + t.SlotIndex;
             list.Add(new TunerChoice(value, t.Name, t.Did, t.SlotIndex, t.Name, false));
         }
@@ -3357,6 +3394,7 @@ body.aircon-runtime-root{position:static;}
             "GR" => "GR",
             "BS" => "BS",
             "CS" => "CS",
+            "CATV" or "ISDB-C" or "CABLE" => "CATV",
             _ => "ALL"
         };
     }
@@ -3364,7 +3402,7 @@ body.aircon-runtime-root{position:static;}
     private static string NormalizeWaveFilter(string? value)
     {
         var v = NormalizeFilter(value);
-        return v is "BS" or "CS" ? v : "GR";
+        return v is "BS" or "CS" or "CATV" ? v : "GR";
     }
 
     private static string FilterLabel(string group)
@@ -3377,6 +3415,8 @@ body.aircon-runtime-root{position:static;}
                 return "BS";
             case "CS":
                 return "CS";
+            case "CATV":
+                return "CATV";
             default:
                 return "全";
         }
@@ -3532,16 +3572,12 @@ body.aircon-runtime-root{position:static;}
     private static string FirstNonEmpty(params string?[] values) => values.FirstOrDefault(x => !string.IsNullOrWhiteSpace(x))?.Trim() ?? string.Empty;
     private static string Html(string? value) => WebUtility.HtmlEncode(value ?? string.Empty);
     private static string HtmlAttr(string? value) => Html(value).Replace("\"", "&quot;");
-    // Developer Diagnostics canonical boundary. The method remains present in every build so
-    // Diagnostics OFF never creates caller/reference breakage. Conditional removes the calls
-    // (including argument evaluation), and the body has no public-build side effects.
-    [System.Diagnostics.Conditional("AIRCON_DEVELOPER_DIAGNOSTICS")]
+#if AIRCON_DEVELOPER_DIAGNOSTICS
     private void SafeLog(string message)
     {
-#if AIRCON_DEVELOPER_DIAGNOSTICS
         try { AIrConNewApiBridge.LogInfo("AIrCon: " + message); } catch { }
-#endif
     }
+#endif
 
     private sealed record ViewerSessionContractState(string ViewerSessionId, long Generation);
     private sealed record ZappingState(bool Active, DateTimeOffset StartedAt, DateTimeOffset LastTickAt, DateTimeOffset NextTickAt, string LastServiceKey, string WindowId, string Wave, string ViewerProfile, long Generation, string ViewerSessionId, long ViewerGeneration, int ProcessId, int IntervalSeconds);
@@ -3554,7 +3590,7 @@ body.aircon-runtime-root{position:static;}
     }
 
     private sealed record ViewerStartPayload(string NetworkId, string TransportStreamId, string ServiceId, string ChannelSpace, string ChannelIndex, string ChannelArgument, string ProgramGuideFilterGroup, string BroadcastGroup, string AllocationGroup, string TunerGroup, string ServiceName, string PreferredTunerName, string PreferredDid, string PreferredSlot, string ViewerProfile, string ViewerProfileName);
-    private sealed record FloatingViewerData(IReadOnlyList<ServiceRow> Services, IReadOnlyList<ViewerSessionRow> ViewerSessions, IReadOnlyList<ViewerTunerRow> ViewerTuners, IReadOnlyList<WaveFilterRow> WaveFilters, ViewerProfileState ViewerProfiles, IReadOnlyList<TvAirProgramEventDto> ProgramEvents, IReadOnlyList<TvAirViewerReservation> ViewerReservations, IReadOnlyList<string> Diagnostics, bool ProjectionUsed, bool SafeEventContractAvailable, bool SafeDblclickEvents, int ServiceColumnWidthPx);
+    private sealed record FloatingViewerData(IReadOnlyList<ServiceRow> Services, IReadOnlyList<ViewerSessionRow> ViewerSessions, IReadOnlyList<ViewerTunerRow> ViewerTuners, IReadOnlyList<WaveFilterRow> WaveFilters, ViewerProfileState ViewerProfiles, IReadOnlyList<TvAirProgramEventDto> ProgramEvents, IReadOnlyList<TvAirViewerReservation> ViewerReservations, bool ProjectionUsed, bool SafeEventContractAvailable, bool SafeDblclickEvents, int ServiceColumnWidthPx);
     private sealed record ViewerOperation(bool CanPost, string ActionEndpoint, string ActionRoute, string ActionMethod, string ActionToken, string PluginId, string RouteSegment);
     private sealed record HostActionDispatchResult(bool Success, string Diagnostics, string Message)
     {
@@ -3571,7 +3607,7 @@ body.aircon-runtime-root{position:static;}
         public string Id => Value;
         public bool IsAvailableForWave(string wave)
         {
-            if (AvailableGroups == null || AvailableGroups.Count == 0) return true;
+            if (AvailableGroups == null || AvailableGroups.Count == 0) return NormalizeWaveFilter(wave) != "CATV";
             var required = RequiredProfileGroupForWave(wave);
             return AvailableGroups.Any(x => NormalizeAvailableGroup(x).Equals(required, StringComparison.OrdinalIgnoreCase));
         }
@@ -3850,21 +3886,17 @@ internal static class AIrConNewApiBridge
         _programProjectionTo = default;
         _programProjectionExpiresAt = default;
     }
-    // Developer-only log sink. Keep the symbol available in every build so Diagnostics OFF
-    // cannot break unguarded call sites; Conditional removes those calls and the body compiles
-    // to a side-effect-free no-op when AIRCON_DEVELOPER_DIAGNOSTICS is not defined.
-    [System.Diagnostics.Conditional("AIRCON_DEVELOPER_DIAGNOSTICS")]
+#if AIRCON_DEVELOPER_DIAGNOSTICS
     internal static void LogInfo(string message)
     {
-#if AIRCON_DEVELOPER_DIAGNOSTICS
         lock (Sync)
         {
             var context = _runtimeContext;
             if (context == null) return;
             context.Logs.Write(new TvAirLogWriteDto { Level = "Info", Category = "AIrCon", Message = message });
         }
-#endif
     }
+#endif
 
     internal static AirConSettings LoadSettings()
     {
@@ -4413,13 +4445,19 @@ internal static class AIrConNewApiBridge
         var accepted = profile.BroadcastGroups.Any(group =>
         {
             var normalized = NormalizeWave(group);
-            return wave == "GR" ? normalized == "GR" : normalized is "BS" or "CS" || group.Contains("BSCS", StringComparison.OrdinalIgnoreCase);
+            return wave switch
+            {
+                "GR" => normalized == "GR",
+                "CATV" => normalized == "CATV",
+                _ => normalized is "BS" or "CS" || group.Contains("BSCS", StringComparison.OrdinalIgnoreCase)
+            };
         });
         if (!accepted) throw new InvalidOperationException("選択した視聴先は現在の放送波に対応していません。");
     }
     private static string NormalizeWave(string? value)
     {
         var text = (value ?? string.Empty).Trim().ToUpperInvariant();
+        if (text is "CATV" or "ISDB-C" or "CABLE") return "CATV";
         if (text == "CS" || text.Contains("CS")) return "CS";
         if (text == "BS" || text.Contains("BS")) return "BS";
         if (text == "GR" || text.Contains("GROUND") || text.Contains("TERRESTRIAL") || text.Contains("地上")) return "GR";

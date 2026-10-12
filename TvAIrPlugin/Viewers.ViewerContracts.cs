@@ -1,4 +1,4 @@
-﻿using TvAIrPlugin.Runtime;
+using TvAIrPlugin.Runtime;
 
 namespace TvAIrPlugin.Viewers;
 
@@ -22,6 +22,11 @@ public sealed record TvAirViewerProfileDto
     public required string DisplayName { get; init; }
     public required bool IsAvailable { get; init; }
     public required bool IsDefault { get; init; }
+    /// <summary>
+    /// Available service display groups for this physical viewer. CATV requires an
+    /// explicitly configured CATV tuner. Its enabled BonDriver/ch2 routes can also advertise GR, BS or CS retransmissions. HYBRID does not imply CATV.
+    /// BS and CS can be reported individually for a configured BSCS tuner.
+    /// </summary>
     public required IReadOnlyList<string> BroadcastGroups { get; init; }
     public required string LogicalViewerSlotId { get; init; }
     /// <summary>TvAIr設定でこのViewerに割り当てられた各放送波内の実デバイス番号。</summary>
@@ -159,6 +164,10 @@ public sealed record TvAirViewerOperationPreempting
     public DateTimeOffset OccurredAt { get; init; }
 }
 
+/// <summary>
+/// Requests one future Host-owned Viewer Operation. ViewerProfileId + ScheduledStart is the execution-slot identity;
+/// ScheduledEnd is programme metadata and never extends ViewerProfile occupancy.
+/// </summary>
 public sealed record TvAirViewerReservationCreateRequest
 {
     public required string ViewerProfileId { get; init; }
@@ -188,6 +197,10 @@ public sealed record TvAirViewerReservation
     public DateTimeOffset UpdatedAt { get; init; }
 }
 
+/// <summary>
+/// Host-owned one-shot Viewer Reservation contract. A successful Viewer Operation completes the reservation exactly once;
+/// later EPG changes, manual tuning, zapping, window lifetime, or Host restart must not replay that reservation.
+/// </summary>
 public interface ITvAirViewerReservationsApi
 {
     Task<TvAirOperationResult<TvAirViewerReservation>> CreateAsync(TvAirViewerReservationCreateRequest request, CancellationToken cancellationToken = default);

@@ -6,7 +6,7 @@ on:
       source_tag:
         description: Published version tag to build
         required: true
-        default: v1.0.5
+        default: v1.0.6
   push:
     tags:
       - 'v*.*.*'
@@ -40,7 +40,7 @@ jobs:
         shell: pwsh
         working-directory: source
         run: |
-          msbuild AIrCon.sln /restore /t:Rebuild /m /nr:false /p:Configuration=Release /p:Platform=${{ matrix.platform }} /p:TvAIrDeveloperDiagnostics=false /p:TvAirPluginDeveloperDiagnostics=false /p:AIrConDeveloperDiagnostics=false /p:AIrhythmDeveloperDiagnostics=false /p:CopyLocalLockFileAssemblies=true /warnaserror
+          msbuild AIrCon.sln /restore /t:Rebuild /m /nr:false /p:LangVersion=12.0 /p:Configuration=Release /p:Platform=${{ matrix.platform }} /p:TvAIrDeveloperDiagnostics=false /p:TvAirPluginDeveloperDiagnostics=false /p:AIrConDeveloperDiagnostics=false /p:AIrhythmDeveloperDiagnostics=false /p:CopyLocalLockFileAssemblies=true /warnaserror
           if ($LASTEXITCODE -ne 0) { throw 'Release build failed or produced warnings' }
       - name: Prepare binary package
         shell: pwsh

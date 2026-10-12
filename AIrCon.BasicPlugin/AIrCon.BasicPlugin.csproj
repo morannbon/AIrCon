@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net8.0-windows</TargetFramework>
     <Nullable>enable</Nullable>
@@ -7,18 +7,19 @@
     <Platforms>AnyCPU;x86;x64</Platforms>
     <RootNamespace>AIrCon.BasicPlugin</RootNamespace>
     <AssemblyName>AIrCon.BasicPlugin</AssemblyName>
-    <Version>1.0.5</Version>
-    <FileVersion>1.0.5.0</FileVersion>
-    <AssemblyVersion>1.0.5.0</AssemblyVersion>
-    <InformationalVersion>1.0.5</InformationalVersion>
+    <Version>1.0.6</Version>
+    <FileVersion>1.0.6.0</FileVersion>
+    <AssemblyVersion>1.0.6.0</AssemblyVersion>
+    <InformationalVersion>1.0.6</InformationalVersion>
     <OutputType>Library</OutputType>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
   </PropertyGroup>
 
   <!--
     Developer Diagnostics canonical build boundary.
-    - This public-release source defaults to OFF.
-    - Development builds may explicitly pass /p:AIrConDeveloperDiagnostics=true.
+    - Development builds enable diagnostics explicitly.
+    - Public distribution defaults OFF; development builds can pass:
+        /p:AIrConDeveloperDiagnostics=true
     - Diagnostic-only logging, measurement and permissions must stay behind
       AIRCON_DEVELOPER_DIAGNOSTICS so OFF builds do not execute diagnostic work.
     - Product behavior must not depend on this boundary.

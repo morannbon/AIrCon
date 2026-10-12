@@ -38,6 +38,7 @@ public interface ITvAirPluginContext
     ITvAirHostsApi Hosts { get; }
     ITvAirPluginsApi Plugins { get; }
     ITvAirExternalLookupApi ExternalLookup { get; }
+    ITvAirInternetAccessApi InternetAccess { get; }
 }
 
 // Runtime plugin implementations receive ITvAirPluginContext through
@@ -253,6 +254,8 @@ public sealed class TvAirKeywordRuleDto
     public bool SearchOutline { get; init; }
     public bool SearchDetail { get; init; }
     public bool SearchCast { get; init; }
+    public bool RecordCurrentServiceOnly { get; init; } = true;
+    public bool RecordSubtitles { get; init; } = true;
     public bool Enabled { get; init; }
     public bool UseAllChannels { get; init; }
     /// <summary>Comma-separated exact service identities in NID:TSID:SID form. SID-only values are legacy Host data and must not be newly authored.</summary>
@@ -460,6 +463,10 @@ public sealed class TvAirReservationDto
     public string? ChainRootReservationId { get; init; }
     public bool IsUserChain { get; init; }
     public bool IsEnabled { get; init; }
+    /// <summary>Hostのサービス操作可否SSOTで現在操作可能な予約局か。</summary>
+    public bool IsServiceOperational { get; init; } = true;
+    /// <summary>IsServiceOperational=false の場合のHost正規理由。Plugin独自の.ch2/ChSet再解釈は禁止。</summary>
+    public string ServiceAccessReason { get; init; } = string.Empty;
     public bool HasConflict { get; init; }
     public int NetworkId { get; init; }
     public int TransportStreamId { get; init; }
@@ -545,7 +552,13 @@ public sealed class TvAirRecordingHistoryDto
     public string QualityCompleteness { get; init; } = string.Empty;
     public string QualitySource { get; init; } = string.Empty;
     public string ResourceReleaseState { get; init; } = string.Empty;
+    /// <summary>
+    /// true の場合、このRecordingIdに対するTvAIr側の録画結果は確定済み。
+    /// FileCreated == true かつ有効なファイルパスがある場合、TvAIrの録画処理による
+    /// 当該ファイルへの書き込み・使用も終了しており、外部後処理は読み取りを開始できる。
+    /// </summary>
     public bool ResultFinalized { get; init; }
+    public bool Succeeded { get; init; }
 }
 
 
@@ -722,6 +735,11 @@ public sealed class TvAirRecordingInspectionJobDto
     public string? Message { get; init; }
 }
 
+/// <summary>
+/// Host projected programme surface for operationally available services only.
+/// Services disabled in TVTest .ch2, absent from .ch2, or without a current Host route are not exposed here.
+/// Raw/canonical EPG retention is a Host concern and is intentionally broader than this Plugin surface.
+/// </summary>
 public interface ITvAirProgramGuideApi
 {
     IReadOnlyList<TvAirProgramGuideWaveFilterDto> ListWaveFilters();
@@ -913,6 +931,7 @@ public sealed class TvAirEpgRunResultDto
     public string? Message { get; init; }
 }
 
+/// <summary>Operational Host services by default. Set Enabled=false only when the plugin explicitly needs disabled .ch2 service metadata; disabled services never appear in ProgramGuide or operational Viewer/Reservation routes.</summary>
 public interface ITvAirChannelsApi
 {
     IReadOnlyList<TvAirServiceDto> ListServices(TvAirServiceQueryDto? query = null);
@@ -991,6 +1010,11 @@ public interface ITvAirViewersApi
     IDisposable SubscribeOperationPreempting(Action<TvAirViewerOperationPreemptingDto> handler);
 }
 
+/// <summary>
+/// Host-owned one-shot Viewer Reservation contract. Reservations conflict only when ViewerProfileId and ScheduledStart are both equal.
+/// ScheduledEnd remains programme metadata and is not a ViewerProfile occupancy boundary.
+/// Create accepts only services that are operationally available under the Host .ch2/route policy.
+/// </summary>
 public interface ITvAirViewerReservationsApi
 {
     TvAirViewerReservationMutationResultDto Create(TvAirViewerReservationCreateRequestDto request);
@@ -998,6 +1022,7 @@ public interface ITvAirViewerReservationsApi
     IReadOnlyList<TvAirViewerReservationDto> List(TvAirViewerReservationQueryDto? query = null);
 }
 
+/// <summary>One future Viewer Operation request; ViewerProfileId + ScheduledStart identifies its execution slot.</summary>
 public sealed class TvAirViewerReservationCreateRequestDto
 {
     public string ViewerProfileId { get; init; } = string.Empty;
@@ -1549,28 +1574,33 @@ public interface ITvAirEventsApi
 
 public enum TvAirEventType
 {
-    ReservationAdded,
-    ReservationUpdated,
-    ReservationRemoved,
-    RecordingStarted,
-    RecordingCompleted,
-    RecordingFailed,
-    EpgStarted,
-    EpgCompleted,
-    EpgCancelled,
-    EpgFailed,
-    TunerChanged,
-    ProgramGuideUpdated,
-    LogAdded,
-    SettingsChanged,
-    ReservationEnabled,
-    ReservationDisabled,
-    ReservationConflictChanged,
-    RecordingResultFinalized,
-    ViewerSessionChanged,
-    RuntimeWindowLifecycleChanged,
-    PluginPermissionChanged,
-    ViewerReservationChanged
+    ReservationAdded = 0,
+    ReservationUpdated = 1,
+    ReservationRemoved = 2,
+    RecordingStarted = 3,
+    RecordingCompleted = 4,
+    RecordingFailed = 5,
+    EpgStarted = 6,
+    EpgCompleted = 7,
+    EpgCancelled = 8,
+    EpgFailed = 9,
+    TunerChanged = 10,
+    ProgramGuideUpdated = 11,
+    LogAdded = 12,
+    SettingsChanged = 13,
+    ReservationEnabled = 14,
+    ReservationDisabled = 15,
+    ReservationConflictChanged = 16,
+    /// <summary>
+    /// 録画結果確定と、存在する録画ファイルのTvAIr側使用終了・外部読取開始可能を示す境界。
+    /// </summary>
+    RecordingResultFinalized = 17,
+    ViewerSessionChanged = 18,
+    /// <summary>Host-managed Runtime ToolWindowのShown/Hidden/Closing/Closed確定事実。</summary>
+    RuntimeWindowLifecycleChanged = 19,
+    PluginPermissionChanged = 20,
+    ViewerReservationChanged = 21,
+    ExternalJobChanged = 22
 }
 
 /// <summary>共通イベント包絡。追加プロパティは既存プラグインとのバイナリ互換を維持する。</summary>
@@ -1589,7 +1619,7 @@ public sealed class TvAirEventDto
     public string? SourceOwnerId { get; init; }
     public long? DataRevision { get; init; }
     public string? ChangeKind { get; init; }
-    /// <summary>旧SDK互換。OccurredAtと同じ値。</summary>
+    /// <summary>OccurredAtと同じ値を返す互換プロパティ。</summary>
     public DateTimeOffset Timestamp { get; init; }
     public TvAirEventType EventType { get; init; }
     public string? ReservationId { get; init; }
@@ -1600,6 +1630,8 @@ public sealed class TvAirEventDto
     public TvAirReservationSnapshotDto? AfterReservation { get; init; }
     public IReadOnlyList<string> ChangedFields { get; init; } = Array.Empty<string>();
     public TvAirRecordingResultDto? RecordingResult { get; init; }
+    /// <summary>ExternalJobChanged のときだけ設定されるHost管理Jobの現在状態。</summary>
+    public TvAirExternalJobDto? ExternalJob { get; init; }
     /// <summary>Host-managed Runtime ToolWindow のライフサイクル確定事実。RuntimeWindowLifecycleChanged のときだけ設定される。</summary>
     public TvAirRuntimeWindowLifecycleDto? RuntimeWindowLifecycle { get; init; }
     /// <summary>Host-owned future Viewer Operation reservation state. Set for ViewerReservationChanged.</summary>
@@ -1608,7 +1640,11 @@ public sealed class TvAirEventDto
 }
 
 
-/// <summary>Host が正本として観測した Runtime ToolWindow のライフサイクル事実。</summary>
+/// <summary>
+/// Hostが正本として観測したRuntime ToolWindowのライフサイクル事実。
+/// Hide/PreserveSessionで非表示になった場合はHidden、再表示はShown、Dispose終端はClosing→Closedとして配送される。
+/// Windowの表示状態とBackgroundExecutionの継続/停止は別契約であり、PluginはCloseBehavior/BackgroundExecutionと合わせて解釈する。
+/// </summary>
 public sealed class TvAirRuntimeWindowLifecycleDto
 {
     public string PluginId { get; init; } = string.Empty;
@@ -1666,7 +1702,14 @@ public sealed class TvAirRecordingResultDto
     public string QualityCompleteness { get; init; } = string.Empty;
     public string QualitySource { get; init; } = string.Empty;
     public string ResourceReleaseState { get; init; } = string.Empty;
+    /// <summary>
+    /// true の場合、このRecordingIdに対するTvAIr側の録画結果は確定済み。
+    /// FileCreated == true かつ有効なFilePathがある場合、TvAIrの録画処理による
+    /// 当該ファイルへの書き込み・使用も終了しており、外部後処理は読み取りを開始できる。
+    /// </summary>
     public bool ResultFinalized { get; init; }
+    /// <summary>TvAIr本体がこの録画を正常完了として確定した型付き正本値。</summary>
+    public bool Succeeded { get; init; }
 }
 
 public interface ITvAirExternalJobsApi
@@ -1684,26 +1727,60 @@ public enum TvAirExternalJobKind
     ExportReport
 }
 
+public enum TvAirExternalJobState
+{
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled
+}
+
+public sealed class TvAirExternalProcessSpecDto
+{
+    public string ExecutablePath { get; init; } = string.Empty;
+    public IReadOnlyList<string> Arguments { get; init; } = Array.Empty<string>();
+    public string? WorkingDirectory { get; init; }
+}
+
 public sealed class TvAirExternalJobRequestDto
 {
     public TvAirExternalJobKind Kind { get; init; }
     public string? ReservationId { get; init; }
+    public string? RecordingId { get; init; }
+    public string ClientRequestId { get; init; } = string.Empty;
+    public TvAirExternalProcessSpecDto? Process { get; init; }
 }
 
 public sealed class TvAirExternalJobQueryDto
 {
     public TvAirExternalJobKind? Kind { get; init; }
+    public TvAirExternalJobState? StateCode { get; init; }
+    /// <summary>互換投影。新規コードはStateCodeを使用する。</summary>
     public string? State { get; init; }
+    public string? RecordingId { get; init; }
+    public string? ClientRequestId { get; init; }
 }
 
 public sealed class TvAirExternalJobDto
 {
     public string JobId { get; init; } = string.Empty;
     public TvAirExternalJobKind Kind { get; init; }
+    public TvAirExternalJobState StateCode { get; init; }
+    /// <summary>StateCodeから生成される互換投影。</summary>
     public string State { get; init; } = string.Empty;
     public string? ReservationId { get; init; }
+    public string? RecordingId { get; init; }
+    public string? ClientRequestId { get; init; }
     public bool Accepted { get; init; }
+    public DateTimeOffset QueuedAt { get; init; }
+    public DateTimeOffset? StartedAt { get; init; }
+    public DateTimeOffset? FinishedAt { get; init; }
+    public int? ExitCode { get; init; }
+    public string? FailureCode { get; init; }
     public string? Message { get; init; }
+    public string? StandardOutputTail { get; init; }
+    public string? StandardErrorTail { get; init; }
 }
 
 public interface ITvAirHostsApi
