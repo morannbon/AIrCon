@@ -12,7 +12,7 @@ namespace AIrCon.BasicPlugin;
 /// </summary>
 internal sealed class AIrConRenderer
 {
-    internal const string PluginVersion = "1.0.6";
+    internal const string PluginVersion = "1.0.7";
     internal const string PluginListTitle = "AIrCon";
     internal static string PluginToolWindowTitle => $"{PluginListTitle} {PluginVersion}";
     internal const string PluginId = "aircon.basic";
@@ -35,6 +35,7 @@ internal sealed class AIrConRenderer
     private const string AirConActionViewerTune = "viewerTune";
     private const string AirConActionViewerReservationToggle = "viewerReservationToggle";
     private const string AirConActionViewerActivate = "viewerActivate";
+    private const string AirConActionBrowseWave = "browseWave";
     private const string AirConActionSettingsOpen = "settingsOpen";
     private const string AirConActionSettingsSave = "settingsSave";
     private const string AirConActionSettingsClose = "settingsClose";
@@ -182,6 +183,16 @@ internal sealed class AIrConRenderer
         {
             var airconAction = PayloadValue(request, "operation", "airconAction", "aircon-action");
             if (string.IsNullOrWhiteSpace(airconAction)) airconAction = request.ActionName;
+            if (airconAction.Equals(AirConActionBrowseWave, StringComparison.OrdinalIgnoreCase))
+            {
+                var windowId = FirstNonEmpty(request.CurrentWindowId, PayloadValue(request, "windowId", "window-id", "currentWindowId", "current-window-id"));
+                var wave = NormalizeWaveFilter(PayloadValue(request, "wave"));
+                var viewerProfile = NormalizeViewerProfileId(PayloadValue(request, "viewerProfile", "viewer-profile"));
+                // Browsing must not activate, start or retune any viewer.
+                var route = "/plugin/aircon?wave=" + Url(wave) + "&viewerProfile=" + Url(viewerProfile);
+                var refresh = AIrConNewApiBridge.RefreshToolWindow(windowId, route);
+                return new RuntimeUiActionResult { Succeeded = refresh.Success, Message = refresh.Success ? "局一覧を表示" : "局一覧の更新に失敗しました。", Diagnostics = refresh.Diagnostics };
+            }
             if (airconAction.Equals(AirConActionSettingsOpen, StringComparison.OrdinalIgnoreCase) ||
                 airconAction.Equals(AirConActionSettingsClose, StringComparison.OrdinalIgnoreCase) ||
                 airconAction.Equals(AirConActionSettingsSave, StringComparison.OrdinalIgnoreCase))
@@ -601,7 +612,7 @@ internal sealed class AIrConRenderer
             var powerOffDeadline = ResolvePowerOffDeadline(selectedViewerProfile.Value);
             var data = CaptureData(filter, viewerProfiles, focusTriplet);
             #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog($"RenderHtml route=aircon mode=viewer_1_0_5 toolWindow={isToolWindow} requestedWave={requestedWave} effectiveWave={filter} viewerProfile={selectedViewerProfile.Value} selectorVisible={viewerProfiles.SelectorVisibleRecommended} profiles={viewerProfiles.SelectableProfiles.Count} services={data.Services.Count} viewers={data.ViewerSessions.Count} activeViewers={data.ViewerSessions.Count(x => x.IsActive)} highlighted={data.Services.Count(x => x.IsViewing)} projectionUsed={data.ProjectionUsed}");
+            SafeLog($"RenderHtml route=aircon mode=viewer_current toolWindow={isToolWindow} requestedWave={requestedWave} effectiveWave={filter} viewerProfile={selectedViewerProfile.Value} selectorVisible={viewerProfiles.SelectorVisibleRecommended} profiles={viewerProfiles.SelectableProfiles.Count} services={data.Services.Count} viewers={data.ViewerSessions.Count} activeViewers={data.ViewerSessions.Count(x => x.IsActive)} highlighted={data.Services.Count(x => x.IsViewing)} projectionUsed={data.ProjectionUsed}");
             #endif
             #if AIRCON_DEVELOPER_DIAGNOSTICS
             if (zappingActive) SafeLog($"ZAPPING_STATE active windowId={windowIdForWave} activeWave={activeZappingWave} displayedWave={filter} viewerProfile={selectedViewerProfile.Value} services={data.Services.Count} intervalSeconds={activeZappingState!.IntervalSeconds}");
@@ -1772,7 +1783,7 @@ internal sealed class AIrConRenderer
         var exact = available.FirstOrDefault(x => x.Id.Equals(desired, StringComparison.OrdinalIgnoreCase));
         if (exact != null) return exact;
 
-        return available.FirstOrDefault() ?? (NormalizeWaveFilter(wave) == "CATV" ? ViewerProfileChoice.Unavailable : selectable.FirstOrDefault() ?? state.SelectableProfiles.FirstOrDefault() ?? ViewerProfileChoice.Unavailable);
+        return available.FirstOrDefault() ?? ViewerProfileChoice.Unavailable;
     }
 
     private static ServiceRow FromRuntimeService(TvAirServiceDto service, int index)
@@ -1906,14 +1917,10 @@ services = NormalizeViewerServiceAuthority(services);
             waveFilters.Add(new WaveFilterRow("BS", "BS", "BS"));
             waveFilters.Add(new WaveFilterRow("CS", "CS", "CS"));
         }
-        // CATV belongs only to a Host-advertised CATV viewing profile; it is never
-        // inferred from a GR/BS/CS HYBRID profile or from the service NID.
-        if (viewerProfiles.AvailableForWave("CATV").Any() && services.Any(x => x.ProgramGuideFilterGroup == "CATV")
+        // Wave visibility follows Host channel classification, independently of viewer availability.
+        if (services.Any(x => x.ProgramGuideFilterGroup.Equals("CATV", StringComparison.OrdinalIgnoreCase))
             && !waveFilters.Any(x => NormalizeWaveFilter(x.Group) == "CATV"))
             waveFilters.Add(new WaveFilterRow("CATV", "CATV", "CATV"));
-        if (!viewerProfiles.AvailableForWave("CATV").Any())
-            waveFilters.RemoveAll(x => NormalizeWaveFilter(x.Group) == "CATV");
-
         if (services.Count > 0 && sessions.Count > 0)
         {
             var map = services
@@ -2762,6 +2769,8 @@ body.aircon-runtime-root{position:static;}
     {
         if (services.Count == 0) return "<div class=\"aircon-empty\">表示対象の局がありません。</div>" + BuildZappingBar(context, false, viewerSessions, action, window, filter, selectedViewerProfile.Value, zappingActive, activeZappingWave, powerOffDeadline);
         var parts = new List<string>();
+        if (!selectedViewerProfile.Enabled)
+            parts.Add("<div class=\"aircon-empty\">局一覧のみ表示しています。視聴には対応する視聴用チューナーの設定が必要です。</div>");
         var rowIndex = 0;
         var selectedSession = viewerSessions
             .Where(x => x.IsActive && x.ViewerProfile.Equals(selectedViewerProfile.Value, StringComparison.OrdinalIgnoreCase))
@@ -2779,7 +2788,7 @@ body.aircon-runtime-root{position:static;}
 
     private static string BuildZappingBar(RuntimeUiRenderContext context, bool enabled, IReadOnlyList<ViewerSessionRow> viewerSessions, ViewerOperation action, WindowOperation window, string filter, string selectedViewerProfile, bool active, string activeWave, DateTimeOffset? powerOffDeadline)
     {
-        var canPost = enabled
+        var canPost = enabled && !string.IsNullOrWhiteSpace(selectedViewerProfile)
             && !string.IsNullOrWhiteSpace(action.ActionEndpoint)
             && !string.IsNullOrWhiteSpace(action.ActionToken)
             && !string.IsNullOrWhiteSpace(window.WindowId);
@@ -2900,7 +2909,9 @@ body.aircon-runtime-root{position:static;}
             : isOtherProfileViewing
                 ? "aircon-row aircon-row-viewing-other"
                 : hasTriplet ? "aircon-row " + parityClass : "aircon-row aircon-row-disabled";
-        var title = hasTriplet ? "ダブルクリックで視聴 / 右クリックで視聴予約" : "このチャンネルは現在視聴できません";
+        var canView = hasTriplet && selectedViewerProfile.Enabled
+            && selectedViewerProfile.IsAvailableForWave(row.ProgramGuideFilterGroup);
+        var title = !selectedViewerProfile.Enabled ? "対応する視聴用チューナーが設定されていません" : hasTriplet ? "ダブルクリックで視聴 / 右クリックで視聴予約" : "このチャンネルは現在視聴できません";
         var current = string.IsNullOrWhiteSpace(row.CurrentTitle) ? "番組情報取得中" : row.CurrentTitle;
         var currentClass = "aircon-current";
         var currentTitleAttr = " title=\"\" aria-label=\"" + HtmlAttr(current) + "\" data-aircon-marquee=\"true\"";
@@ -2914,7 +2925,7 @@ body.aircon-runtime-root{position:static;}
             BuildCurrentTimeHtml(row) +
             $"<span class=\"{currentClass}\"{currentTitleAttr}><span class=\"aircon-current-track\"><span class=\"aircon-current-text\">{Html(current)}</span><span class=\"aircon-current-copy\" aria-hidden=\"true\">{Html(current)}</span></span></span>";
 
-        if (!hasTriplet)
+        if (!canView)
         {
             return $"<div class=\"{cls}\" title=\"{HtmlAttr(title)}\">" + content + "</div>";
         }
@@ -3332,9 +3343,14 @@ body.aircon-runtime-root{position:static;}
         var targetProfile = profiles.AvailableForWave(group)
             .FirstOrDefault(x => x.Id.Equals(selectedViewerProfile.Value, StringComparison.OrdinalIgnoreCase))
             ?? profiles.AvailableForWave(group).FirstOrDefault();
-        if (targetProfile == null)
-            return $"<button class=\"{cls} aircon-wave-button-disabled\" type=\"button\" disabled aria-disabled=\"true\">{Html(label)}</button>";
-        var fields = BuildViewerActivateFields(action, window, group, targetProfile.Id);
+        var fields = new Dictionary<string, string?>
+        {
+            ["operation"] = AirConActionBrowseWave,
+            ["wave"] = group,
+            ["viewerProfile"] = targetProfile?.Id ?? string.Empty,
+            ["refreshQuery"] = "wave=" + group + "&viewerProfile=" + (targetProfile?.Id ?? string.Empty),
+            ["clientVersion"] = ClientVersion
+        };
         // Wave selection refreshes only the ToolWindow content route.
         // AIrCon owns row positioning inside its own HTML after render.
         var attrs = BuildHostActionAttributes(context, fields, "click", "hostHandled");
