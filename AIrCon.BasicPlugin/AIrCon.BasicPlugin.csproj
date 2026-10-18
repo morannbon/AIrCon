@@ -7,19 +7,19 @@
     <Platforms>AnyCPU;x86;x64</Platforms>
     <RootNamespace>AIrCon.BasicPlugin</RootNamespace>
     <AssemblyName>AIrCon.BasicPlugin</AssemblyName>
-    <Version>1.0.7</Version>
-    <FileVersion>1.0.7.0</FileVersion>
-    <AssemblyVersion>1.0.7.0</AssemblyVersion>
-    <InformationalVersion>1.0.7</InformationalVersion>
+    <Version>1.0.8</Version>
+    <FileVersion>1.0.8.0</FileVersion>
+    <AssemblyVersion>1.0.8.0</AssemblyVersion>
+    <InformationalVersion>1.0.8</InformationalVersion>
     <OutputType>Library</OutputType>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
   </PropertyGroup>
 
   <!--
     Developer Diagnostics canonical build boundary.
-    - Development builds enable diagnostics explicitly.
-    - Public distribution defaults OFF; development builds can pass:
-        /p:AIrConDeveloperDiagnostics=true
+    - Normal development builds explicitly enable diagnostics.
+    - Public builds use the default OFF configuration (or pass):
+        /p:AIrConDeveloperDiagnostics=false /p:TvAIrDeveloperDiagnostics=false
     - Diagnostic-only logging, measurement and permissions must stay behind
       AIRCON_DEVELOPER_DIAGNOSTICS so OFF builds do not execute diagnostic work.
     - Product behavior must not depend on this boundary.

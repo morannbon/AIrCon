@@ -12,7 +12,7 @@ namespace AIrCon.BasicPlugin;
 /// </summary>
 internal sealed class AIrConRenderer
 {
-    internal const string PluginVersion = "1.0.7";
+    internal const string PluginVersion = "1.0.8";
     internal const string PluginListTitle = "AIrCon";
     internal static string PluginToolWindowTitle => $"{PluginListTitle} {PluginVersion}";
     internal const string PluginId = "aircon.basic";
@@ -188,7 +188,9 @@ internal sealed class AIrConRenderer
                 var windowId = FirstNonEmpty(request.CurrentWindowId, PayloadValue(request, "windowId", "window-id", "currentWindowId", "current-window-id"));
                 var wave = NormalizeWaveFilter(PayloadValue(request, "wave"));
                 var viewerProfile = NormalizeViewerProfileId(PayloadValue(request, "viewerProfile", "viewer-profile"));
-                // Browsing must not activate, start or retune any viewer.
+                // browseWave is the list-only route. Wave buttons with a compatible Viewer Profile
+                // intentionally use the existing viewerActivate action instead (see BuildFilterForm).
+                // Do not activate/start/tune here: CATV or other waves lacking a viewer must remain browsable.
                 var route = "/plugin/aircon?wave=" + Url(wave) + "&viewerProfile=" + Url(viewerProfile);
                 var refresh = AIrConNewApiBridge.RefreshToolWindow(windowId, route);
                 return new RuntimeUiActionResult { Succeeded = refresh.Success, Message = refresh.Success ? "局一覧を表示" : "局一覧の更新に失敗しました。", Diagnostics = refresh.Diagnostics };
@@ -295,8 +297,25 @@ internal sealed class AIrConRenderer
                         return new RuntimeUiActionResult { Succeeded = refreshOnly.Success, Message = "視聴先を選択", Diagnostics = refreshOnly.Success ? "viewer_not_running_selection_applied_and_refreshed" : refreshOnly.Diagnostics };
                     }
 
+                    // Broadcast-wave buttons intentionally combine two user actions: browse the
+                    // selected wave's station list and focus its already-running compatible TVTest.
+                    // Browsing must work even without a viewer (for example, CATV service lists),
+                    // but removing viewer activation here would break the established wave-button UI.
+                    // Refresh the list before requesting activation, to reduce the risk that the
+                    // ToolWindow takes focus back. Host refresh may be asynchronous, so it cannot
+                    // itself guarantee the final foreground window. Do not start, tune or retune
+                    // TVTest from this button. Keep these invariants when changing CATV or layout.
+                    var waveButtonClick = PayloadValue(request, "waveButton")
+                        .Equals("true", StringComparison.OrdinalIgnoreCase);
+                    AIrConNewApiBridge.OperationResult? refresh = waveButtonClick
+                        ? AIrConNewApiBridge.RefreshToolWindow(windowId, contentRoute)
+                        : null;
+                    if (waveButtonClick && refresh is { Success: false } failedRefresh)
+                        return new RuntimeUiActionResult { Succeeded = false, Message = "局一覧の更新に失敗しました。", Diagnostics = failedRefresh.Diagnostics };
                     var activated = await AIrConNewApiBridge.ActivateAsync(viewerProfile).ConfigureAwait(false);
-                    var refresh = AIrConNewApiBridge.RefreshToolWindow(windowId, contentRoute);
+                    // In the non-wave-button route, refresh occurs after activation as before.
+                    // In the wave-button route, retain the earlier refresh result without repeating it.
+                    refresh ??= AIrConNewApiBridge.RefreshToolWindow(windowId, contentRoute);
                     var recoveredNotRunning = activated.Success && activated.Diagnostics.Equals("viewer_process_exited_recovered", StringComparison.OrdinalIgnoreCase);
                     var success = activated.Success && refresh.Success;
                     #if AIRCON_DEVELOPER_DIAGNOSTICS
@@ -611,6 +630,23 @@ internal sealed class AIrConRenderer
             if (zappingActive && activeZappingWave.Equals(filter, StringComparison.OrdinalIgnoreCase)) UpdateZappingWindowSubscription(selectedViewerProfile.Value, windowIdForWave, filter);
             var powerOffDeadline = ResolvePowerOffDeadline(selectedViewerProfile.Value);
             var data = CaptureData(filter, viewerProfiles, focusTriplet);
+            // A saved wave may no longer have any configured service. Select a visible
+            // wave from the same Host channel snapshot; never infer reception from tuners.
+            var visibleWaves = CanonicalWaveFilters(data.WaveFilters);
+            if (visibleWaves.Count > 0 && !visibleWaves.Any(x => x.Group.Equals(filter, StringComparison.OrdinalIgnoreCase)))
+            {
+                filter = visibleWaves[0].Group;
+                RememberWave(windowIdForWave, filter, isToolWindow);
+                selectedViewerProfile = ResolveSelectedViewerProfile(requestedViewerProfile, viewerProfiles, filter);
+                RememberViewerProfile(windowIdForWave, selectedViewerProfile.Value, isToolWindow);
+                activeZappingState = GetActiveZappingState(selectedViewerProfile.Value);
+                zappingActive = activeZappingState != null;
+                activeZappingWave = activeZappingState?.Wave ?? string.Empty;
+                if (zappingActive && activeZappingWave.Equals(filter, StringComparison.OrdinalIgnoreCase))
+                    UpdateZappingWindowSubscription(selectedViewerProfile.Value, windowIdForWave, filter);
+                powerOffDeadline = ResolvePowerOffDeadline(selectedViewerProfile.Value);
+                data = CaptureData(filter, viewerProfiles, focusTriplet);
+            }
             #if AIRCON_DEVELOPER_DIAGNOSTICS
             SafeLog($"RenderHtml route=aircon mode=viewer_current toolWindow={isToolWindow} requestedWave={requestedWave} effectiveWave={filter} viewerProfile={selectedViewerProfile.Value} selectorVisible={viewerProfiles.SelectorVisibleRecommended} profiles={viewerProfiles.SelectableProfiles.Count} services={data.Services.Count} viewers={data.ViewerSessions.Count} activeViewers={data.ViewerSessions.Count(x => x.IsActive)} highlighted={data.Services.Count(x => x.IsViewing)} projectionUsed={data.ProjectionUsed}");
             #endif
@@ -1837,6 +1873,9 @@ internal sealed class AIrConRenderer
         var programEvents = new List<TvAirProgramEventDto>();
         var viewerReservations = new List<TvAirViewerReservation>();
         var projectionUsed = false;
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+        var channelSnapshotReceived = false;
+#endif
         var safeEventContractAvailable = false;
         var safeDblclickEvents = false;
 
@@ -1851,6 +1890,7 @@ internal sealed class AIrConRenderer
                 .Select((x, index) => FromRuntimeService(x, index))
                 .ToList();
 #if AIRCON_DEVELOPER_DIAGNOSTICS
+            channelSnapshotReceived = true;
             SafeLog("viewerControlChannels=Runtime count=" + services.Count + " source=runtime_channels");
 #endif
 
@@ -1906,21 +1946,34 @@ internal sealed class AIrConRenderer
 
 services = NormalizeViewerServiceAuthority(services);
 
+        // A successful empty Channels snapshot means no configured enabled stations.
+        // A failed Channels lookup is unknown, not evidence of GR/BS/CS reception.
+        // Never add ungrounded wave buttons after filtering the authoritative services.
+        var availableWaves = services.Select(x => NormalizeWaveFilter(x.ProgramGuideFilterGroup))
+            .Where(x => x is "GR" or "BS" or "CS" or "CATV")
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        waveFilters = waveFilters
+            .Where(x => availableWaves.Contains(NormalizeWaveFilter(x.Group)))
+            .ToList();
+        // A missing wave-filter catalogue must not hide stations the Channels API did return.
+        // Labels/order are canonically normalized by CanonicalWaveFilters at render time.
+        foreach (var wave in new[] { "GR", "BS", "CS", "CATV" })
+        {
+            if (availableWaves.Contains(wave) && !waveFilters.Any(x => NormalizeWaveFilter(x.Group) == wave))
+                waveFilters.Add(new WaveFilterRow(wave, wave, wave == "GR" ? "地上波" : wave));
+        }
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+        SafeLog("WAVE_VISIBILITY source=runtime_channels snapshot="
+            + (channelSnapshotReceived ? "received" : "failed_or_unavailable")
+            + " enabledServices=" + services.Count + " visibleWaves=" + string.Join(",", availableWaves)
+            + " filters=" + waveFilters.Count);
+#endif
+
 #if AIRCON_DEVELOPER_DIAGNOSTICS
         var zeroTripletFinal = services.Count(x => x.NetworkId <= 0 || x.TransportStreamId <= 0 || x.ServiceId <= 0);
         if (zeroTripletFinal > 0) SafeLog("TRIPLET_DIAG finalZero=" + zeroTripletFinal);
 #endif
 
-        if (waveFilters.Count == 0)
-        {
-            waveFilters.Add(new WaveFilterRow("GR", "GR", "地"));
-            waveFilters.Add(new WaveFilterRow("BS", "BS", "BS"));
-            waveFilters.Add(new WaveFilterRow("CS", "CS", "CS"));
-        }
-        // Wave visibility follows Host channel classification, independently of viewer availability.
-        if (services.Any(x => x.ProgramGuideFilterGroup.Equals("CATV", StringComparison.OrdinalIgnoreCase))
-            && !waveFilters.Any(x => NormalizeWaveFilter(x.Group) == "CATV"))
-            waveFilters.Add(new WaveFilterRow("CATV", "CATV", "CATV"));
         if (services.Count > 0 && sessions.Count > 0)
         {
             var map = services
@@ -2570,7 +2623,7 @@ body.aircon-runtime-root{position:static;}
 .aircon-profile-button-disabled{opacity:.45;cursor:default;background:var(--aircon-disabled-bg);color:var(--aircon-disabled-text);}
 .aircon-toolbar-button-disabled{opacity:.70;cursor:default;background:var(--aircon-disabled-bg);color:var(--aircon-disabled-text);}
 .aircon-toolbar-wave-area.aircon-wave-four .aircon-wave-group{width:153px;}
-.aircon-toolbar-wave-area.aircon-wave-four .aircon-wave-button{width:39px;min-width:39px;}
+.aircon-toolbar-wave-area.aircon-wave-four .aircon-wave-button{width:39px;min-width:39px;max-width:39px;padding-left:0;padding-right:0;text-align:center;}
 .aircon-wave-button{width:{{waveButtonWidth}}px;min-width:{{waveButtonWidth}}px;border-radius:0;background:var(--aircon-button-bg);border-color:var(--aircon-button-border);color:var(--aircon-button-text);}
 .aircon-wave-button-on{background:var(--aircon-accent);color:var(--aircon-accent-text);border-color:var(--aircon-button-border);}
 .aircon-wave-button-on:hover,.aircon-wave-button-on:focus,.aircon-wave-button-on:active{background:var(--aircon-accent);color:var(--aircon-accent-text);border-color:var(--aircon-button-border);}
@@ -2759,8 +2812,9 @@ body.aircon-runtime-root{position:static;}
     private static IReadOnlyList<WaveFilterRow> CanonicalWaveFilters(IReadOnlyList<WaveFilterRow> source)
     {
         static string LabelFor(string group) => group.Equals("GR", StringComparison.OrdinalIgnoreCase) ? "地上波" : group.ToUpperInvariant();
-        var groups = new List<string> { "GR", "BS", "CS" };
-        if (source.Any(x => NormalizeWaveFilter(x.Group) == "CATV")) groups.Add("CATV");
+        var groups = new[] { "GR", "BS", "CS", "CATV" }
+            .Where(group => source.Any(x => NormalizeWaveFilter(x.Group) == group))
+            .ToList();
         return groups.Select(group => new WaveFilterRow(group, group, LabelFor(group)))
             .ToArray();
     }
@@ -3345,13 +3399,19 @@ body.aircon-runtime-root{position:static;}
             ?? profiles.AvailableForWave(group).FirstOrDefault();
         var fields = new Dictionary<string, string?>
         {
-            ["operation"] = AirConActionBrowseWave,
+            ["operation"] = targetProfile == null ? AirConActionBrowseWave : AirConActionViewerActivate,
             ["wave"] = group,
             ["viewerProfile"] = targetProfile?.Id ?? string.Empty,
+            ["waveButton"] = "true",
             ["refreshQuery"] = "wave=" + group + "&viewerProfile=" + (targetProfile?.Id ?? string.Empty),
             ["clientVersion"] = ClientVersion
         };
-        // Wave selection refreshes only the ToolWindow content route.
+        // IMPORTANT regression guard: wave buttons deliberately combine wave browsing and focus.
+        // Reuse the existing viewerActivate path when a compatible profile exists; it activates
+        // ONLY an already-running TVTest, and refreshes the wave list BEFORE requesting focus.
+        // With no viewer profile (notably CATV), browseWave must still permit list-only browsing.
+        // This focus behavior predates CATV support and was accidentally removed in v1.0.6.
+        // Never remove it as a UI cleanup, and never start TVTest or retune merely on wave click.
         // AIrCon owns row positioning inside its own HTML after render.
         var attrs = BuildHostActionAttributes(context, fields, "click", "hostHandled");
         return "<span class=\"aircon-nav-form\" data-role=\"wave-selector\" data-wave=\"" + HtmlAttr(group) + "\">" +

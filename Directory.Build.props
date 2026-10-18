@@ -10,7 +10,7 @@
     <TvAIrPluginHostContractName>plugin-host-foundation</TvAIrPluginHostContractName>
     <TvAIrPluginCompatibilityMajor>1</TvAIrPluginCompatibilityMajor>
     <TvAIrMinimumSupportedPluginHostContractVersion>1.0.0</TvAIrMinimumSupportedPluginHostContractVersion>
-    <!-- Developer Diagnostics build boundary. Public distribution defaults diagnostics OFF; development builds can explicitly enable them. User operational logs remain enabled. -->
+    <!-- Developer Diagnostics build boundary. Public source defaults diagnostics OFF. Development builds explicitly enable diagnostics. User operational logs remain enabled. -->
     <TvAIrDeveloperDiagnostics Condition="'$(TvAIrDeveloperDiagnostics)' == ''">false</TvAIrDeveloperDiagnostics>
     <DefineConstants Condition="'$(TvAIrDeveloperDiagnostics)' == 'true'">$(DefineConstants);TVAIR_DEVELOPER_DIAGNOSTICS</DefineConstants>
   </PropertyGroup>

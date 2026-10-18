@@ -4,7 +4,7 @@ param(
     [string]$SourceRoot='.'
 )
 $ErrorActionPreference='Stop'
-$spec=ConvertFrom-Json '{"Docs":["README.md","README.txt","LICENSE","THIRD_PARTY_NOTICES.txt"],"Version":"1.0.7","Host":"1.2.8","Dll":"AIrCon.BasicPlugin.dll","Project":"AIrCon.BasicPlugin","Framework":"","Solution":"AIrCon.sln","Name":"AIrCon"}'
+$spec=ConvertFrom-Json '{"Docs":["README.md","README.txt","LICENSE","THIRD_PARTY_NOTICES.txt"],"Version":"1.0.8","Host":"1.2.13","Dll":"AIrCon.BasicPlugin.dll","Project":"AIrCon.BasicPlugin","Framework":"","Solution":"AIrCon.sln","Name":"AIrCon"}'
 $root=(Resolve-Path -LiteralPath $SourceRoot).Path
 [xml]$project=Get-Content -LiteralPath (Join-Path $root "$($spec.Project)/$($spec.Project).csproj")
 if($spec.Name -eq 'AI-rhythm') {
@@ -50,4 +50,5 @@ TvAIrを起動し、プラグインメニューに表示されることを確認
 ライセンス文書は配布物の利用条件です。SDK_LICENSE.txtがある場合は同梱SDKの利用条件を示します。
 "@ | Set-Content -LiteralPath (Join-Path $out 'INSTALL.txt') -Encoding UTF8
 Compress-Archive -Path "$out/*" -DestinationPath "package/$($spec.Name)_v${version}_${Platform}.zip"
+
 
