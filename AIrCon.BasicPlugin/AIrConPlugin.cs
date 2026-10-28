@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using System.Net;
 using TvAIrPlugin;
 using TvAIrPlugin.Runtime;
@@ -12,7 +12,7 @@ namespace AIrCon.BasicPlugin;
 /// </summary>
 internal sealed class AIrConRenderer
 {
-    internal const string PluginVersion = "1.0.8";
+    internal const string PluginVersion = "1.0.9";
     internal const string PluginListTitle = "AIrCon";
     internal static string PluginToolWindowTitle => $"{PluginListTitle} {PluginVersion}";
     internal const string PluginId = "aircon.basic";
@@ -92,9 +92,22 @@ internal sealed class AIrConRenderer
 
     private readonly Dictionary<string, string> _lastWaveByWindowId = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _lastViewerProfileByWindowId = new(StringComparer.OrdinalIgnoreCase);
+    // Only the service actually rendered for the selected Viewer Profile is used
+    // to decide whether a Host-owned retune requires a ToolWindow refresh.
+    // This is bounded by the PerRoute window lifecycle and never polls TVTest.
+    private readonly Dictionary<string, string> _renderedServiceByWindowId = new(StringComparer.OrdinalIgnoreCase);
+
     private readonly object _zappingLock = new();
     private readonly Dictionary<string, ZappingState> _zappingStates = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, Timer> _zappingTimers = new(StringComparer.OrdinalIgnoreCase);
+    // One bounded, per-viewer acknowledgment for the currently dispatched zapping retune.
+    // The tick owns its refresh; suppress only its exact Host event, never an external retune.
+    private readonly Dictionary<string, (string SessionId, long Generation, string ServiceKey)> _zappingOwnRetunes = new(StringComparer.OrdinalIgnoreCase);
+    // A successful manual double-click owns the Host action-response refresh.
+    // For a newly launched viewer the Host assigns the session ID during TuneAsync;
+    // an empty expected SessionId therefore means *new generation 1 only*.
+    // Existing sessions always require an exact ID/generation/service match.
+    private readonly Dictionary<string, (string SessionId, long Generation, string ServiceKey)> _manualOwnRetunes = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _powerOffLock = new();
     private readonly Dictionary<string, PowerOffState> _powerOffStates = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, Timer> _powerOffTimers = new(StringComparer.OrdinalIgnoreCase);
@@ -175,6 +188,7 @@ internal sealed class AIrConRenderer
         }
         lock (_lastWaveByWindowId) _lastWaveByWindowId.Clear();
         lock (_lastViewerProfileByWindowId) _lastViewerProfileByWindowId.Clear();
+        lock (_renderedServiceByWindowId) _renderedServiceByWindowId.Clear();
     }
 
     public async Task<RuntimeUiActionResult> HandleActionAsync(RuntimeUiActionContext request, CancellationToken cancellationToken)
@@ -191,7 +205,7 @@ internal sealed class AIrConRenderer
                 // browseWave is the list-only route. Wave buttons with a compatible Viewer Profile
                 // intentionally use the existing viewerActivate action instead (see BuildFilterForm).
                 // Do not activate/start/tune here: CATV or other waves lacking a viewer must remain browsable.
-                var route = "/plugin/aircon?wave=" + Url(wave) + "&viewerProfile=" + Url(viewerProfile);
+                var route = BuildViewerContentRoute(wave, viewerProfile);
                 var refresh = AIrConNewApiBridge.RefreshToolWindow(windowId, route);
                 return new RuntimeUiActionResult { Succeeded = refresh.Success, Message = refresh.Success ? "局一覧を表示" : "局一覧の更新に失敗しました。", Diagnostics = refresh.Diagnostics };
             }
@@ -236,7 +250,7 @@ internal sealed class AIrConRenderer
                     #if AIRCON_DEVELOPER_DIAGNOSTICS
                     SafeLog($"SETTINGS_SAVE_VERIFY result=OK writtenRemember={remember} readBackRemember={verifiedSettings.RememberWindowPlacement} writtenInterval={interval} readBackInterval={verifiedSettings.ZappingIntervalSeconds} writtenWave={startupWave} readBackWave={verifiedSettings.StartupWave}");
                     #endif
-                    var route = "/plugin/aircon?wave=" + Url(returnWave) + (string.IsNullOrWhiteSpace(returnProfile) ? string.Empty : "&viewerProfile=" + Url(returnProfile));
+                    var route = BuildViewerContentRoute(returnWave, returnProfile);
                     var refresh = AIrConNewApiBridge.RefreshToolWindow(settingsWindowId, route);
                     #if AIRCON_DEVELOPER_DIAGNOSTICS
                     SafeLog($"SETTINGS_SAVE result={(refresh.Success ? "OK" : "FAILED")} rememberPlacement={remember} zappingIntervalSeconds={interval} startupWave={startupWave} refresh={refresh.Diagnostics}");
@@ -247,7 +261,7 @@ internal sealed class AIrConRenderer
                 var returnQuery = "returnWave=" + Url(returnWave) + (string.IsNullOrWhiteSpace(returnProfile) ? string.Empty : "&returnViewerProfile=" + Url(returnProfile));
                 var targetRoute = airconAction.Equals(AirConActionSettingsOpen, StringComparison.OrdinalIgnoreCase)
                     ? "/plugin/aircon?view=settings&" + returnQuery
-                    : "/plugin/aircon?wave=" + Url(returnWave) + (string.IsNullOrWhiteSpace(returnProfile) ? string.Empty : "&viewerProfile=" + Url(returnProfile));
+                    : BuildViewerContentRoute(returnWave, returnProfile);
                 var settingsRefresh = AIrConNewApiBridge.RefreshToolWindow(settingsWindowId, targetRoute);
                 #if AIRCON_DEVELOPER_DIAGNOSTICS
                 SafeLog($"SETTINGS_VIEW action={airconAction} result={(settingsRefresh.Success ? "OK" : "FAILED")} diagnostics={settingsRefresh.Diagnostics}");
@@ -287,7 +301,7 @@ internal sealed class AIrConRenderer
                         .Where(x => !x.State.Equals("stopped", StringComparison.OrdinalIgnoreCase))
                         .Where(x => !x.State.Equals("closed", StringComparison.OrdinalIgnoreCase))
                         .FirstOrDefault(x => x.ViewerProfileId.Equals(viewerProfile, StringComparison.OrdinalIgnoreCase));
-                    var contentRoute = "/plugin/aircon?wave=" + Url(wave) + "&viewerProfile=" + Url(viewerProfile);
+                    var contentRoute = BuildViewerContentRoute(wave, viewerProfile);
                     if (liveSession == null)
                     {
                         var refreshOnly = AIrConNewApiBridge.RefreshToolWindow(windowId, contentRoute);
@@ -369,7 +383,7 @@ internal sealed class AIrConRenderer
                         RefreshRequested = reservationResult.Success,
                         RefreshTarget = "content",
                         PreserveScroll = true,
-                        ContentRoute = "/plugin/aircon?wave=" + Url(wave) + "&viewerProfile=" + Url(returnViewerProfile)
+                        ContentRoute = BuildViewerContentRoute(wave, returnViewerProfile)
                     };
                 }
 
@@ -389,7 +403,7 @@ internal sealed class AIrConRenderer
                         RefreshRequested = tuned.Success,
                         RefreshTarget = "content",
                         PreserveScroll = false,
-                        ContentRoute = "/plugin/aircon?wave=" + Url(wave) + "&viewerProfile=" + Url(viewerProfile)
+                        ContentRoute = BuildViewerContentRoute(wave, viewerProfile)
                     };
                 }
 
@@ -647,6 +661,18 @@ internal sealed class AIrConRenderer
                 powerOffDeadline = ResolvePowerOffDeadline(selectedViewerProfile.Value);
                 data = CaptureData(filter, viewerProfiles, focusTriplet);
             }
+            // Capture the displayed state, not merely the latest Host session. A retune
+            // occurring through the TvAIr program guide otherwise leaves the old row
+            // selected until some unrelated UI navigation happens.
+            if (isToolWindow && !string.IsNullOrWhiteSpace(windowIdForWave))
+            {
+                var shownSession = data.ViewerSessions.FirstOrDefault(x =>
+                    x.IsActive && x.ViewerProfile.Equals(selectedViewerProfile.Value, StringComparison.OrdinalIgnoreCase));
+                var shownService = shownSession is { NetworkId: > 0, TransportStreamId: > 0, ServiceId: > 0 }
+                    ? ServiceKey(shownSession.NetworkId.Value, shownSession.TransportStreamId.Value, shownSession.ServiceId.Value)
+                    : string.Empty;
+                lock (_renderedServiceByWindowId) _renderedServiceByWindowId[windowIdForWave] = shownService;
+            }
             #if AIRCON_DEVELOPER_DIAGNOSTICS
             SafeLog($"RenderHtml route=aircon mode=viewer_current toolWindow={isToolWindow} requestedWave={requestedWave} effectiveWave={filter} viewerProfile={selectedViewerProfile.Value} selectorVisible={viewerProfiles.SelectorVisibleRecommended} profiles={viewerProfiles.SelectableProfiles.Count} services={data.Services.Count} viewers={data.ViewerSessions.Count} activeViewers={data.ViewerSessions.Count(x => x.IsActive)} highlighted={data.Services.Count(x => x.IsViewing)} projectionUsed={data.ProjectionUsed}");
             #endif
@@ -791,6 +817,7 @@ internal sealed class AIrConRenderer
         lock (_zappingLock)
         {
             _zappingStates.Remove(key);
+            _zappingOwnRetunes.Remove(key);
             if (_zappingTimers.Remove(key, out var timer)) timer.Dispose();
         }
     }
@@ -831,31 +858,51 @@ internal sealed class AIrConRenderer
             var wave = state.Wave;
             var windowId = state.WindowId;
 
-            // BackgroundExecution=StopWithWindow is owned by the ToolWindow that started the
-            // automation.  The Refresh contract may be used as the owner preflight only when this
-            // exact wave/profile is currently rendered.  A background zapping profile must never
-            // refresh or rerender the ToolWindow merely as a liveness probe, because that crosses
-            // the Plugin semantic-state boundary and can disturb the visible wave/profile.
-            // This remains intentionally not Windows.Get/List.
-            if (!string.IsNullOrWhiteSpace(windowId) && IsWindowDisplaying(windowId, wave, viewerProfile))
+            // Lifecycle Shown/Closing/Closed owns window liveness. Do not issue a
+            // presentation refresh merely to probe the zapping owner's window:
+            // ViewerSessionChanged and the successful tick already refresh the view.
+
+            var liveSession = AIrConNewApiBridge.ListSessions().FirstOrDefault(x =>
+                x.ViewerSessionId.Equals(state.ViewerSessionId, StringComparison.Ordinal));
+            if (liveSession is null ||
+                !liveSession.ViewerProfileId.Equals(viewerProfile, StringComparison.Ordinal) ||
+                liveSession.ProcessId != state.ProcessId || liveSession.Generation <= 0)
             {
-                var ownerRefresh = AIrConNewApiBridge.RefreshToolWindow(windowId, null);
+                RemoveZappingState(viewerProfile);
                 #if AIRCON_DEVELOPER_DIAGNOSTICS
-                SafeLog($"ZAPPING_WINDOW_REFRESH result={(ownerRefresh.Success ? "OK" : "FAILED")} mode=owner_preflight windowId={windowId} wave={wave} viewerProfile={viewerProfile} refreshIssued=True diagnostics={ownerRefresh.Diagnostics}");
+                SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=viewer_identity_changed expectedSession={state.ViewerSessionId} expectedPid={state.ProcessId}");
                 #endif
-                if (!ownerRefresh.Success && IsDefinitiveWindowGone(ownerRefresh.Diagnostics))
-                {
-                    StopWindowBackgroundExecution(windowId);
-                    #if AIRCON_DEVELOPER_DIAGNOSTICS
-                    SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=refresh_target_not_found_before_dispatch windowId={windowId} diagnostics={ownerRefresh.Diagnostics} backgroundExecution=StopWithWindow");
-                    #endif
-                    return new ZappingTickResult(false, "zapping_window_closed");
-                }
+                return new ZappingTickResult(false, "zapping_viewer_identity_changed");
             }
-            else if (!string.IsNullOrWhiteSpace(windowId))
+
+            // A Host retune on the same Viewer session/PID advances the session generation.
+            // Follow its authoritative service so the next tick advances from that channel.
+            // Never transfer zapping to another session or process.
+            if (liveSession.Generation != state.ViewerGeneration)
             {
+                var current = liveSession.CurrentService;
+                var currentWave = current is { NetworkId: > 0, TransportStreamId: > 0, ServiceId: > 0 }
+                    ? ResolveServiceWave(current)
+                    : string.Empty;
+                if (!NormalizeWaveFilter(currentWave).Equals(wave, StringComparison.OrdinalIgnoreCase))
+                {
+                    RemoveZappingState(viewerProfile);
+                    #if AIRCON_DEVELOPER_DIAGNOSTICS
+                    SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=viewer_wave_changed expectedWave={wave} actualWave={currentWave}");
+                    #endif
+                    return new ZappingTickResult(false, "zapping_viewer_wave_changed");
+                }
+                var currentKey = ServiceKey(current!.NetworkId, current.TransportStreamId, current.ServiceId);
+                lock (_zappingLock)
+                {
+                    if (!_zappingStates.TryGetValue(key, out var latest) ||
+                        !latest.Active || latest.Generation != state.Generation)
+                        return new ZappingTickResult(false, "zapping_superseded");
+                    state = latest with { ViewerGeneration = liveSession.Generation, LastServiceKey = currentKey };
+                    _zappingStates[key] = state;
+                }
                 #if AIRCON_DEVELOPER_DIAGNOSTICS
-                SafeLog($"ZAPPING_WINDOW_REFRESH result=SKIPPED mode=owner_preflight reason=event_profile_not_displayed windowId={windowId} wave={wave} viewerProfile={viewerProfile} refreshIssued=False action=viewer_state_only");
+                SafeLog($"ZAPPING_STATE resynced viewerProfile={viewerProfile} session={state.ViewerSessionId} pid={state.ProcessId} generation={state.ViewerGeneration} service={currentKey} source=host_retune_same_identity");
                 #endif
             }
 
@@ -897,15 +944,12 @@ internal sealed class AIrConRenderer
                 return new ZappingTickResult(false, "zapping_superseded");
             }
 
-            var liveSession = AIrConNewApiBridge.ListSessions().FirstOrDefault(x => x.ViewerSessionId.Equals(state.ViewerSessionId, StringComparison.Ordinal));
-            if (liveSession is null || !liveSession.ViewerProfileId.Equals(viewerProfile, StringComparison.Ordinal) || liveSession.ProcessId != state.ProcessId || liveSession.Generation != state.ViewerGeneration)
-            {
-                RemoveZappingState(viewerProfile);
-                #if AIRCON_DEVELOPER_DIAGNOSTICS
-                SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=viewer_identity_changed expectedSession={state.ViewerSessionId} expectedGeneration={state.ViewerGeneration} expectedPid={state.ProcessId}");
-                #endif
-                return new ZappingTickResult(false, "zapping_viewer_identity_changed");
-            }
+            // An exact next-generation acknowledgment identifies only this tick's retune.
+            // Install it BEFORE dispatch because ViewerSessionChanged may be delivered
+            // synchronously inside the Host operation. It remains valid for delayed delivery.
+            var expectedServiceKey = ServiceKey(target.NetworkId, target.TransportStreamId, target.ServiceId);
+            lock (_zappingLock)
+                _zappingOwnRetunes[key] = (state.ViewerSessionId, liveSession.Generation + 1, expectedServiceKey);
             var result = await SwitchViewerServiceCoreAsync(
                 viewerProfile,
                 wave,
@@ -916,6 +960,12 @@ internal sealed class AIrConRenderer
                 TvAirViewerActivation.Preserve,
                 () => IsCurrentZappingGeneration(viewerProfile, state.Generation)).ConfigureAwait(false);
             var mayContinue = result.OperationCompleted && result.ContinuationRecommended;
+            if (!mayContinue || !string.Equals(result.ViewerSessionId, state.ViewerSessionId, StringComparison.Ordinal) ||
+                result.Generation != liveSession.Generation + 1)
+            {
+                // Unexpected Host result: let any later event refresh normally.
+                lock (_zappingLock) _zappingOwnRetunes.Remove(key);
+            }
             var serviceKey = mayContinue
                 ? ServiceKey(target.NetworkId, target.TransportStreamId, target.ServiceId)
                 : state.LastServiceKey;
@@ -1188,6 +1238,7 @@ internal sealed class AIrConRenderer
             foreach (var key in keys)
             {
                 _zappingStates.Remove(key);
+                _zappingOwnRetunes.Remove(key);
                 if (_zappingTimers.Remove(key, out var timer)) timer.Dispose();
             }
         }
@@ -1207,6 +1258,7 @@ internal sealed class AIrConRenderer
 
         lock (_lastWaveByWindowId) _lastWaveByWindowId.Remove(windowId);
         lock (_lastViewerProfileByWindowId) _lastViewerProfileByWindowId.Remove(windowId);
+        lock (_renderedServiceByWindowId) _renderedServiceByWindowId.Remove(windowId);
     }
 
     private static bool IsDefinitiveWindowGone(string diagnostics)
@@ -1285,6 +1337,20 @@ internal sealed class AIrConRenderer
             return AIrConNewApiBridge.OperationResult.Fail("superseded_before_tune", "Viewer switch was superseded before tuning.");
 
         var before = FindActiveViewerSession(viewerProfile);
+        var manualAction = source.Equals("manual_dblclick", StringComparison.Ordinal);
+        var existingSession = before != null && !string.IsNullOrWhiteSpace(before.ViewerSessionId) &&
+            before.ProcessId.GetValueOrDefault() > 0 && before.Generation > 0;
+        var manualServiceKey = ServiceKey(networkId, transportStreamId, serviceId);
+        if (manualAction)
+        {
+            // Register before the Host call: its event may be dispatched synchronously.
+            // A newly started session has no ID until TuneAsync completes; only the
+            // initial generation (1) with this exact target triplet can acknowledge it.
+            lock (_zappingLock)
+                _manualOwnRetunes[BuildZappingKey(viewerProfile)] = existingSession
+                    ? (before!.ViewerSessionId, before.Generation + 1, manualServiceKey)
+                    : (string.Empty, 1L, manualServiceKey);
+        }
         var start = await AIrConNewApiBridge.TuneAsync(
             viewerProfile,
             wave,
@@ -1294,6 +1360,8 @@ internal sealed class AIrConRenderer
             viewerActivation: viewerActivation).ConfigureAwait(false);
         if (!start.Success)
         {
+            if (manualAction)
+                lock (_zappingLock) _manualOwnRetunes.Remove(BuildZappingKey(viewerProfile));
             #if AIRCON_DEVELOPER_DIAGNOSTICS
             SafeLog($"VIEWER_SWITCH source={source} phase=tune profileId={viewerProfile} result=FAILED diagnostics={start.Diagnostics}");
             #endif
@@ -1301,14 +1369,42 @@ internal sealed class AIrConRenderer
         }
 
         if (continuationGuard != null && !continuationGuard())
+        {
+            if (manualAction)
+                lock (_zappingLock) _manualOwnRetunes.Remove(BuildZappingKey(viewerProfile));
             return AIrConNewApiBridge.OperationResult.Fail("superseded_after_tune", "Viewer switch was superseded after tuning.");
+        }
 
         if (start.NetworkId != networkId || start.TransportStreamId != transportStreamId || start.ServiceId != serviceId)
         {
+            if (manualAction)
+                lock (_zappingLock) _manualOwnRetunes.Remove(BuildZappingKey(viewerProfile));
             #if AIRCON_DEVELOPER_DIAGNOSTICS
             SafeLog($"VIEWER_SWITCH source={source} phase=operation_result profileId={viewerProfile} wave={wave} nid={networkId} tsid={transportStreamId} sid={serviceId} result=FAILED diagnostics=viewer_operation_identity_mismatch");
             #endif
             return AIrConNewApiBridge.OperationResult.Fail("viewer_operation_identity_mismatch", "Viewer operation returned a different service identity.");
+        }
+
+        // Unexpected session identity or generation must follow the normal event refresh.
+        // For a new launch, generation 1 is the only own acknowledgment we can accept.
+        if (manualAction && (existingSession
+            ? (!string.Equals(start.ViewerSessionId, before!.ViewerSessionId, StringComparison.Ordinal) ||
+               start.Generation != before.Generation + 1)
+            : (string.IsNullOrWhiteSpace(start.ViewerSessionId) || start.Generation != 1)))
+            lock (_zappingLock) _manualOwnRetunes.Remove(BuildZappingKey(viewerProfile));
+
+        // Once the Host has returned the new session, replace the short-lived
+        // generation-1 launch wildcard with its exact session ID, if not yet consumed.
+        if (manualAction && !existingSession && !string.IsNullOrWhiteSpace(start.ViewerSessionId))
+        {
+            lock (_zappingLock)
+            {
+                var key = BuildZappingKey(viewerProfile);
+                if (_manualOwnRetunes.TryGetValue(key, out var pending) &&
+                    pending.SessionId.Length == 0 && pending.Generation == 1 &&
+                    pending.ServiceKey.Equals(manualServiceKey, StringComparison.OrdinalIgnoreCase))
+                    _manualOwnRetunes[key] = (start.ViewerSessionId, 1, manualServiceKey);
+            }
         }
 
         AIrConNewApiBridge.InvalidateViewerProjection();
@@ -1438,7 +1534,7 @@ internal sealed class AIrConRenderer
         {
             lock (_lastViewerProfileByWindowId) _lastViewerProfileByWindowId[windowId] = reservation.ViewerProfileId;
             lock (_lastWaveByWindowId) _lastWaveByWindowId[windowId] = wave;
-            var route = "/plugin/aircon?wave=" + Url(wave) + "&viewerProfile=" + Url(reservation.ViewerProfileId);
+            var route = BuildViewerContentRoute(wave, reservation.ViewerProfileId);
             var refresh = AIrConNewApiBridge.RefreshToolWindow(windowId, route);
 #if AIRCON_DEVELOPER_DIAGNOSTICS
             SafeLog($"VIEWER_RESERVATION_DISPLAY result={(refresh.Success ? "OK" : "FAILED")} reservation={reservation.ReservationId} viewerProfile={reservation.ViewerProfileId} wave={wave} windowId={windowId} diagnostics={refresh.Diagnostics}");
@@ -1516,9 +1612,95 @@ internal sealed class AIrConRenderer
             && !eventSession.State.Equals("closed", StringComparison.OrdinalIgnoreCase);
         if (active)
         {
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog($"VIEWER_SESSION_STATEPATCH result=SKIPPED reason=viewer_still_active viewerSession={viewerSessionId} viewerProfile={viewerProfile} revision={eventEnvelope.Sequence}");
-            #endif
+            // ViewerSessionChanged also reports Host-owned retunes of an existing TVTest.
+            // The prior terminal-only branch discarded those events and kept the old row
+            // highlighted even though CurrentService had advanced on the Host.
+            var service = eventSession.CurrentService;
+            if (service is not { NetworkId: > 0, TransportStreamId: > 0, ServiceId: > 0 }) return;
+            var currentKey = ServiceKey(service.NetworkId, service.TransportStreamId, service.ServiceId);
+            var currentWave = ResolveServiceWave(service);
+            // A manual double-click's successful action response owns its content refresh.
+            // Consume only the exact expected Host acknowledgment once. External retunes,
+            // newer generations and unrelated services must retain normal presentation updates.
+            lock (_zappingLock)
+            {
+                var ownKey = BuildZappingKey(viewerProfile);
+                if (_manualOwnRetunes.TryGetValue(ownKey, out var ownManual) &&
+                    (ownManual.SessionId.Equals(viewerSessionId, StringComparison.Ordinal) ||
+                     (ownManual.SessionId.Length == 0 && eventSession.Generation == 1)) &&
+                    ownManual.Generation == eventSession.Generation &&
+                    ownManual.ServiceKey.Equals(currentKey, StringComparison.OrdinalIgnoreCase))
+                {
+                    _manualOwnRetunes.Remove(ownKey);
+                    #if AIRCON_DEVELOPER_DIAGNOSTICS
+                    SafeLog($"VIEWER_SESSION_STATEPATCH result=SKIPPED reason=manual_action_owns_refresh viewerProfile={viewerProfile} service={currentKey} generation={eventSession.Generation} revision={eventEnvelope.Sequence}");
+                    #endif
+                    return;
+                }
+            }
+            // The zapping tick independently refreshes its visible wave after success.
+            // Skip only a matching acknowledgment, not other Host/ProgramGuide retunes.
+            lock (_zappingLock)
+            {
+                var zappingKey = BuildZappingKey(viewerProfile);
+                if (_zappingOwnRetunes.TryGetValue(zappingKey, out var own) &&
+                    own.SessionId.Equals(viewerSessionId, StringComparison.Ordinal) &&
+                    own.Generation == eventSession.Generation &&
+                    own.ServiceKey.Equals(currentKey, StringComparison.OrdinalIgnoreCase) &&
+                    _zappingStates.TryGetValue(zappingKey, out var running) && running.Active)
+                {
+                    #if AIRCON_DEVELOPER_DIAGNOSTICS
+                    SafeLog($"VIEWER_SESSION_STATEPATCH result=SKIPPED reason=zapping_tick_owns_refresh viewerProfile={viewerProfile} service={currentKey} generation={eventSession.Generation} revision={eventEnvelope.Sequence}");
+                    #endif
+                    return;
+                }
+            }
+            KeyValuePair<string, string>[] windows;
+            lock (_lastViewerProfileByWindowId)
+                windows = _lastViewerProfileByWindowId
+                    .Where(x => x.Value.Equals(viewerProfile, StringComparison.OrdinalIgnoreCase))
+                    .ToArray();
+            foreach (var pair in windows)
+            {
+                var windowId = pair.Key;
+                if (string.IsNullOrWhiteSpace(windowId)) continue;
+                string renderedKey;
+                lock (_renderedServiceByWindowId)
+                    if (!_renderedServiceByWindowId.TryGetValue(windowId, out renderedKey!)) continue;
+                if (renderedKey.Equals(currentKey, StringComparison.OrdinalIgnoreCase)) continue;
+
+                // Preserve a manually browsed wave. Follow cross-wave retunes only
+                // when this window had been displaying the *previous* tuned service.
+                string displayedWave;
+                lock (_lastWaveByWindowId)
+                    if (!_lastWaveByWindowId.TryGetValue(windowId, out displayedWave!)) continue;
+                var displayedFilter = NormalizeWaveFilter(displayedWave);
+                string? refreshRoute = null;
+                if (!displayedFilter.Equals(currentWave, StringComparison.OrdinalIgnoreCase))
+                {
+                    var priorService = AIrConNewApiBridge.ListServices().FirstOrDefault(row =>
+                        ServiceKey(row.NetworkId, row.TransportStreamId, row.ServiceId)
+                            .Equals(renderedKey, StringComparison.OrdinalIgnoreCase));
+                    if (priorService == null ||
+                        !NormalizeWaveFilter(priorService.BroadcastType).Equals(displayedFilter, StringComparison.OrdinalIgnoreCase))
+                    {
+                        #if AIRCON_DEVELOPER_DIAGNOSTICS
+                        SafeLog($"VIEWER_SESSION_STATEPATCH result=SKIPPED reason=browsing_other_wave windowId={windowId} viewerProfile={viewerProfile} displayedWave={displayedWave} currentWave={currentWave} revision={eventEnvelope.Sequence}");
+                        #endif
+                        continue;
+                    }
+                    refreshRoute = BuildViewerContentRoute(currentWave, viewerProfile);
+                }
+
+                // Host owns the channel; refresh is presentation-only and never issues
+                // a new ViewerOperation, retune, activation, or window foreground request.
+                var refreshed = AIrConNewApiBridge.RefreshToolWindow(windowId, refreshRoute);
+                #if AIRCON_DEVELOPER_DIAGNOSTICS
+                SafeLog($"VIEWER_SESSION_STATEPATCH result={(refreshed.Success ? "REFRESHED" : "FAILED")} reason=active_service_changed windowId={windowId} viewerProfile={viewerProfile} service={currentKey} revision={eventEnvelope.Sequence} diagnostics={refreshed.Diagnostics}");
+                #endif
+                if (!refreshed.Success && IsDefinitiveWindowGone(refreshed.Diagnostics))
+                    StopWindowBackgroundExecution(windowId);
+            }
             return;
         }
 
@@ -3066,6 +3248,17 @@ body.aircon-runtime-root{position:static;}
 
     private static bool HasResolvedTriplet(ServiceRow row)
         => row.NetworkId > 0 && row.TransportStreamId > 0 && row.ServiceId > 0;
+
+    // ContentRoute is a Plugin navigation path, never a bare query string.
+    // Keep the existing route when the Viewer Profile is intentionally absent
+    // (e.g. a wave without a configured viewer).
+    private static string BuildViewerContentRoute(string wave, string? viewerProfile)
+    {
+        var route = "/plugin/aircon?wave=" + Url(wave);
+        return string.IsNullOrWhiteSpace(viewerProfile)
+            ? route
+            : route + "&viewerProfile=" + Url(viewerProfile);
+    }
 
     private static string Url(string value) => WebUtility.UrlEncode(value);
 

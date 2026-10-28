@@ -1,16 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
 <Project>
   <PropertyGroup>
-    <TvAIrProductVersion>1.2.8</TvAIrProductVersion>
-    <TvAIrFileVersion>1.2.8.0</TvAIrFileVersion>
-    <TvAIrAssemblyVersion>1.2.8.0</TvAIrAssemblyVersion>
-    <TvAIrPluginSdkVersion>1.1.14</TvAIrPluginSdkVersion>
+    <TvAIrProductVersion>1.2.14</TvAIrProductVersion>
+    <TvAIrFileVersion>1.2.14.0</TvAIrFileVersion>
+    <TvAIrAssemblyVersion>1.2.14.0</TvAIrAssemblyVersion>
+    <TvAIrPluginSdkVersion>1.1.18</TvAIrPluginSdkVersion>
     <TvAIrPluginSdkAssemblyVersion>1.0.0.0</TvAIrPluginSdkAssemblyVersion>
-    <TvAIrPluginHostContractVersion>1.1.14</TvAIrPluginHostContractVersion>
+    <TvAIrPluginHostContractVersion>1.1.18</TvAIrPluginHostContractVersion>
     <TvAIrPublicContractName>release_contract</TvAIrPublicContractName>
     <TvAIrPluginHostContractName>plugin-host-foundation</TvAIrPluginHostContractName>
     <TvAIrPluginCompatibilityMajor>1</TvAIrPluginCompatibilityMajor>
     <TvAIrMinimumSupportedPluginHostContractVersion>1.0.0</TvAIrMinimumSupportedPluginHostContractVersion>
-    <!-- Developer Diagnostics build boundary. Public source defaults diagnostics OFF. Development builds explicitly enable diagnostics. User operational logs remain enabled. -->
+    <!-- Developer Diagnostics build boundary. Public release source defaults OFF; development builds explicitly enable diagnostics. User operational logs remain enabled. -->
     <TvAIrDeveloperDiagnostics Condition="'$(TvAIrDeveloperDiagnostics)' == ''">false</TvAIrDeveloperDiagnostics>
     <DefineConstants Condition="'$(TvAIrDeveloperDiagnostics)' == 'true'">$(DefineConstants);TVAIR_DEVELOPER_DIAGNOSTICS</DefineConstants>
   </PropertyGroup>
