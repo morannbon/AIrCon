@@ -123,19 +123,19 @@ internal sealed partial class AIrConRenderer
             Timeout.InfiniteTimeSpan);
     }
 
-    private async Task<ZappingTickResult> RunZappingTickAsync(
+    private async Task RunZappingTickAsync(
         string viewerProfile, long? expectedGeneration, string source, long? expectedLifecycleVersion = null)
     {
-        if (_runtimeUiStopped) return new ZappingTickResult(false, "runtime_stopped");
+        if (_runtimeUiStopped) return;
         var lifecycleVersion = expectedLifecycleVersion ?? CaptureRuntimeUiLifecycle();
         if (!IsCurrentRuntimeUiLifecycle(lifecycleVersion))
-            return new ZappingTickResult(false, "runtime_stopped");
+            return;
         using var gate = GetProfileOperationGate(viewerProfile);
         await gate.WaitAsync().ConfigureAwait(false);
         try
         {
             if (!IsCurrentRuntimeUiLifecycle(lifecycleVersion))
-                return new ZappingTickResult(false, "runtime_stopped");
+                return;
             var key = BuildZappingKey(viewerProfile);
             ZappingState state;
             lock (_zappingLock)
@@ -147,7 +147,7 @@ internal sealed partial class AIrConRenderer
                     #if AIRCON_DEVELOPER_DIAGNOSTICS
                     SafeLog($"ZAPPING_TICK skipped reason=inactive_or_superseded viewerProfile={viewerProfile} source={source}");
                     #endif
-                    return new ZappingTickResult(false, "zapping_inactive_or_superseded");
+                    return;
                 }
             }
 
@@ -168,7 +168,7 @@ internal sealed partial class AIrConRenderer
                 #if AIRCON_DEVELOPER_DIAGNOSTICS
                 SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=viewer_identity_changed expectedSession={state.ViewerSessionId} expectedPid={state.ProcessId}");
                 #endif
-                return new ZappingTickResult(false, "zapping_viewer_identity_changed");
+                return;
             }
 
             // A Host retune on the same Viewer session/PID advances the session generation.
@@ -186,14 +186,14 @@ internal sealed partial class AIrConRenderer
                     #if AIRCON_DEVELOPER_DIAGNOSTICS
                     SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=viewer_wave_changed expectedWave={wave} actualWave={currentWave}");
                     #endif
-                    return new ZappingTickResult(false, "zapping_viewer_wave_changed");
+                    return;
                 }
                 var currentKey = ServiceKey(current!.NetworkId, current.TransportStreamId, current.ServiceId);
                 lock (_zappingLock)
                 {
                     if (!_zappingStates.TryGetValue(key, out var latest) ||
                         !latest.Active || latest.Generation != state.Generation)
-                        return new ZappingTickResult(false, "zapping_superseded");
+                        return;
                     state = latest with { ViewerGeneration = liveSession.Generation, LastServiceKey = currentKey };
                     _zappingStates[key] = state;
                 }
@@ -215,7 +215,7 @@ internal sealed partial class AIrConRenderer
                 #if AIRCON_DEVELOPER_DIAGNOSTICS
                 SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=no_services");
                 #endif
-                return new ZappingTickResult(false, "zapping_no_services");
+                return;
             }
 
             var lastIndex = -1;
@@ -242,7 +242,7 @@ internal sealed partial class AIrConRenderer
                 #if AIRCON_DEVELOPER_DIAGNOSTICS
                 SafeLog($"ZAPPING_TICK skipped reason=superseded_before_dispatch viewerProfile={viewerProfile} generation={state.Generation} source={source}");
                 #endif
-                return new ZappingTickResult(false, "zapping_superseded");
+                return;
             }
 
             // The Host session event owns the corresponding UI transition.
@@ -268,7 +268,7 @@ internal sealed partial class AIrConRenderer
                     #if AIRCON_DEVELOPER_DIAGNOSTICS
                     SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=replacement_identity_missing");
                     #endif
-                    return new ZappingTickResult(false, "zapping_replacement_identity_missing");
+                    return;
                 }
                 var replacementProcessId = replacement.ProcessId.GetValueOrDefault();
                 ScheduleZappingAfterAttempt(viewerProfile, state.Generation, serviceKey, replacement.ViewerSessionId, replacement.Generation, replacementProcessId);
@@ -290,7 +290,7 @@ internal sealed partial class AIrConRenderer
 #endif
             // No duplicate ToolWindow refresh. The authoritative ViewerSessionChanged
             // handler patches both colors and schedules the scroll to the same row.
-            return new ZappingTickResult(result.Success, result.Success ? "zapping_tick_ok" : "zapping_tick_failed");
+            return;
         }
 #if AIRCON_DEVELOPER_DIAGNOSTICS
         catch (Exception ex)
@@ -307,7 +307,7 @@ internal sealed partial class AIrConRenderer
             #if AIRCON_DEVELOPER_DIAGNOSTICS
             SafeLog($"ZAPPING_TICK failed viewerProfile={viewerProfile} source={source} exception={ex.GetType().Name} message={ex.Message}");
             #endif
-            return new ZappingTickResult(false, "zapping_tick_exception");
+            return;
         }
         finally
         {

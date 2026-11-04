@@ -220,7 +220,6 @@ internal sealed partial class AIrConRenderer
     private sealed record ViewerSessionContractState(string ViewerSessionId, long Generation);
     private sealed record ZappingState(bool Active, DateTimeOffset StartedAt, DateTimeOffset LastTickAt, DateTimeOffset NextTickAt, string LastServiceKey, string WindowId, string Wave, string ViewerProfile, long Generation, string ViewerSessionId, long ViewerGeneration, int ProcessId, int IntervalSeconds);
     private sealed record PowerOffState(bool Active, DateTimeOffset Deadline, string ViewerProfile, string WindowId, long Generation);
-    private sealed record ZappingTickResult(bool Success, string Diagnostics);
 
     private sealed record FocusTriplet(int? NetworkId, int? TransportStreamId, int? ServiceId)
     {
