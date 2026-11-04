@@ -2,7 +2,7 @@
   "Name": "AIrCon",
   "Solution": "AIrCon.sln",
   "Dll": "AIrCon.BasicPlugin.dll",
-  "Version": "1.0.9",
+  "Version": "1.0.10",
   "Project": "AIrCon.BasicPlugin",
   "Framework": ""
 }

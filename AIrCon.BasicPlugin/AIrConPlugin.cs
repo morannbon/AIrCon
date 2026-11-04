@@ -1,8 +1,9 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 using System.Net;
 using TvAIrPlugin;
 using TvAIrPlugin.Runtime;
 using TvAIrPlugin.Viewers;
+using ThreadingTimer = System.Threading.Timer;
 
 namespace AIrCon.BasicPlugin;
 
@@ -10,9 +11,9 @@ namespace AIrCon.BasicPlugin;
 /// AIrCon 視聴操作Plugin。
 /// ToolWindow内の行ダブルクリック視聴と右クリック視聴予約を主導線にする。
 /// </summary>
-internal sealed class AIrConRenderer
+internal sealed partial class AIrConRenderer
 {
-    internal const string PluginVersion = "1.0.9";
+    internal const string PluginVersion = "1.0.10";
     internal const string PluginListTitle = "AIrCon";
     internal static string PluginToolWindowTitle => $"{PluginListTitle} {PluginVersion}";
     internal const string PluginId = "aircon.basic";
@@ -23,12 +24,10 @@ internal sealed class AIrConRenderer
     private const string RefreshTargetContent = "content";
     private const string BoolTrue = "true";
     private const string BoolFalse = "false";
-    private const string ActionViewerStop = "viewerStop";
     private const string ActionPluginOwned = "pluginOwnedAction";
     private const string ActionUpdateWindow = "updateWindow";
     private const string AirConActionZappingStart = "zappingStart";
     private const string AirConActionZappingStop = "zappingStop";
-    private const string AirConActionZappingTick = "zappingTick";
     private const string AirConActionPowerOffStart = "powerOffStart";
     private const string AirConActionPowerOffStop = "powerOffStop";
     private const string AirConActionViewerPowerOff = "viewerPowerOff";
@@ -45,6 +44,12 @@ internal sealed class AIrConRenderer
     internal const string SettingZappingIntervalSeconds = "zappingIntervalSeconds";
     internal const string SettingStartupWave = "startupWave";
     internal const int DefaultZappingIntervalSeconds = 60;
+    internal const string DefaultStartupWave = "GR";
+    private static readonly int[] ZappingIntervals = { 30, 60, 90, 120, 180 };
+    private static readonly string[] StartupWaves = { "GR", "BS", "CS", "CATV" };
+
+    internal static int ValidateZappingInterval(int value) =>
+        Array.IndexOf(ZappingIntervals, value) >= 0 ? value : DefaultZappingIntervalSeconds;
 
     // Tool-window layout metrics are centralized here.
     // The WinForms WebBrowser fallback is IE-like. Use only layout features already validated in this host;
@@ -65,10 +70,10 @@ internal sealed class AIrConRenderer
     private const int ToolWindowWaveButtonWidthPx = 50;
     private const int ToolWindowWaveAreaWidthPx = 206;
     private const int ToolWindowViewerProfileNumericButtonWidthPx = 24;
-    private const int ToolWindowDefaultWidthPx = 540;
-    private const int ToolWindowDefaultHeightPx = 320;
-    private const int ToolWindowMinimumWidthContractPx = 360;
-    private const int ToolWindowMinimumHeightContractPx = 180;
+    internal const int ToolWindowDefaultWidthPx = 540;
+    internal const int ToolWindowDefaultHeightPx = 320;
+    internal const int ToolWindowMinimumWidthContractPx = 360;
+    internal const int ToolWindowMinimumHeightContractPx = 180;
     private const int ToolWindowMinimumListRowsPx = 1;
     private static int ToolWindowActionButtonSizePx => ToolWindowToolbarButtonHeightPx;
     private static int ToolWindowActionButtonGroupWidthPx => (ToolWindowActionButtonSizePx * 4) + (ToolWindowToolbarCellGapPx * 3);
@@ -80,7 +85,6 @@ internal sealed class AIrConRenderer
     private const int ToolWindowServiceColumnMaximumWidthPx = 240;
     private const int ToolWindowServiceColumnHorizontalReservePx = 12;
     private const int ToolWindowTimeColumnWidthPx = 42;
-    private const string CurrentViewingAnchorId = "aircon-current-viewing-anchor";
 
     private static int ToolWindowToolbarButtonHeightPx => ToolWindowButtonTextLineHeightPx + (ToolWindowButtonVerticalPaddingPx * 2) + (ToolWindowButtonBorderPx * 2);
     private static int ToolWindowToolbarCellHeightPx => ToolWindowToolbarButtonHeightPx;
@@ -90,31 +94,133 @@ internal sealed class AIrConRenderer
     private static int ToolWindowMinimumWidthPx => ToolWindowMinimumWidthContractPx;
     private static int ToolWindowMinimumHeightPx => Math.Max(ToolWindowMinimumHeightContractPx, ToolWindowToolbarHeightPx + (ToolWindowRowHeightPx * ToolWindowMinimumListRowsPx) + 16);
 
-    private readonly Dictionary<string, string> _lastWaveByWindowId = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, string> _lastViewerProfileByWindowId = new(StringComparer.OrdinalIgnoreCase);
-    // Only the service actually rendered for the selected Viewer Profile is used
-    // to decide whether a Host-owned retune requires a ToolWindow refresh.
-    // This is bounded by the PerRoute window lifecycle and never polls TVTest.
-    private readonly Dictionary<string, string> _renderedServiceByWindowId = new(StringComparer.OrdinalIgnoreCase);
+    // One per-window snapshot owns the latest render request and navigation intent.
+    // RenderHtml generates markup, but does NOT prove that the Host has displayed it.
+    // Only the browser's matching DOM identity authorizes a native scroll. A deferred
+    // navigation remains separate from the last generated wave/profile until rendered.
+    private sealed record WindowDisplayState(string Wave, string ViewerProfile,
+        string ServiceKey, long RenderVersion,
+        string? RequestedWave = null, string? RequestedViewerProfile = null);
+    private readonly object _windowDisplayLock = new();
+    private readonly Dictionary<string, WindowDisplayState> _windowDisplays =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private WindowDisplayState? GetWindowDisplay(string windowId)
+    {
+        if (string.IsNullOrWhiteSpace(windowId)) return null;
+        lock (_windowDisplayLock)
+            return _windowDisplays.TryGetValue(windowId, out var state) ? state : null;
+    }
+
+    private KeyValuePair<string, WindowDisplayState>[] SnapshotWindowDisplays()
+    {
+        lock (_windowDisplayLock) return _windowDisplays.ToArray();
+    }
+
+    private void PublishWindowDisplay(string windowId, string wave, string viewerProfile,
+        string serviceKey, long renderVersion)
+    {
+        if (string.IsNullOrWhiteSpace(windowId)) return;
+        lock (_windowDisplayLock)
+            _windowDisplays[windowId] = new WindowDisplayState(
+                NormalizeWaveFilter(wave), viewerProfile, serviceKey, renderVersion);
+    }
+
+    // A navigation request is not a completed navigation. Record its intent only
+    // with an actual Host refresh. Failed requests restore the prior snapshot;
+    // successful requests are committed by RenderHtml for the new document.
+    private AIrConNewApiBridge.OperationResult RequestWindowDisplayNavigation(
+        string windowId, string wave, string viewerProfile, string? contentRoute = null)
+    {
+        WindowDisplayState? before;
+        WindowDisplayState? request = null;
+        lock (_windowDisplayLock)
+        {
+            _windowDisplays.TryGetValue(windowId, out before);
+            if (before != null)
+            {
+                request = before with
+                {
+                    RequestedWave = NormalizeWaveFilter(wave),
+                    RequestedViewerProfile = viewerProfile
+                };
+                _windowDisplays[windowId] = request;
+            }
+        }
+
+        var refresh = AIrConNewApiBridge.RefreshToolWindow(windowId,
+            contentRoute ?? BuildViewerContentRoute(wave, viewerProfile));
+        if (!refresh.Success && request != null)
+        {
+            lock (_windowDisplayLock)
+            {
+                // Reference identity protects an overlapping navigation even when
+                // it targets the same wave/profile and render generation.
+                if (_windowDisplays.TryGetValue(windowId, out var current)
+                    && ReferenceEquals(current, request))
+                    _windowDisplays[windowId] = before!;
+            }
+        }
+        return refresh;
+    }
+
+    // A wave click selects the list, not a refresh command. A fully rendered, unchanged
+    // wave/profile has nothing to navigate; avoid a needless Host document rebuild.
+    // Pending navigation is never treated as completed rendering.
+    private AIrConNewApiBridge.OperationResult RequestWaveNavigation(
+        string windowId, string wave, string viewerProfile)
+    {
+        var displayed = GetWindowDisplay(windowId);
+        if (displayed != null && displayed.RequestedWave == null &&
+            displayed.RequestedViewerProfile == null &&
+            displayed.Wave.Equals(wave, StringComparison.OrdinalIgnoreCase) &&
+            displayed.ViewerProfile.Equals(viewerProfile, StringComparison.OrdinalIgnoreCase))
+            return AIrConNewApiBridge.OperationResult.Ok("wave_already_displayed");
+        return RequestWindowDisplayNavigation(windowId, wave, viewerProfile);
+    }
+
+    private void SetRenderedService(string windowId, string serviceKey)
+    {
+        lock (_windowDisplayLock)
+            if (_windowDisplays.TryGetValue(windowId, out var prior))
+                _windowDisplays[windowId] = prior with { ServiceKey = serviceKey };
+    }
+    private long _nextRenderVersion;
+    private const int CenterScrollMaxAttempts = 16;
+    private const int CenterScrollRetryDelayMs = 200;
+    // Scroll position belongs to the existing list element. Selection and destination
+    // come from the same ViewerSession, never from separate URL fragments or CSS offsets.
+    // Selection and its scroll destination share one service identity. Never use a
+    // separate, mutable DOM ID for the same station during an asynchronous retune.
+    private sealed record CurrentStation(string Wave, string ViewerProfile, string ServiceKey, string RowId);
+    private readonly object _centerRequestLock = new();
+    private readonly Dictionary<string, CancellationTokenSource> _pendingCenterByWindow = new(StringComparer.OrdinalIgnoreCase);
+    // Runtime lifecycle is read from timer and UI threads. A restarted plugin
+    // must never accept work queued by the preceding lifecycle.
+    private volatile bool _runtimeUiStopped;
+    private long _runtimeUiLifecycleVersion;
+
+    private long CaptureRuntimeUiLifecycle() => Interlocked.Read(ref _runtimeUiLifecycleVersion);
+    private bool IsCurrentRuntimeUiLifecycle(long version) =>
+        !_runtimeUiStopped && CaptureRuntimeUiLifecycle() == version;
+
 
     private readonly object _zappingLock = new();
     private readonly Dictionary<string, ZappingState> _zappingStates = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, Timer> _zappingTimers = new(StringComparer.OrdinalIgnoreCase);
-    // One bounded, per-viewer acknowledgment for the currently dispatched zapping retune.
-    // The tick owns its refresh; suppress only its exact Host event, never an external retune.
-    private readonly Dictionary<string, (string SessionId, long Generation, string ServiceKey)> _zappingOwnRetunes = new(StringComparer.OrdinalIgnoreCase);
-    // A successful manual double-click owns the Host action-response refresh.
-    // For a newly launched viewer the Host assigns the session ID during TuneAsync;
-    // an empty expected SessionId therefore means *new generation 1 only*.
-    // Existing sessions always require an exact ID/generation/service match.
-    private readonly Dictionary<string, (string SessionId, long Generation, string ServiceKey)> _manualOwnRetunes = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, ThreadingTimer> _zappingTimers = new(StringComparer.OrdinalIgnoreCase);
+    // One short-lived, profile-scoped intent from a TvAIr ProgramGuide selection.
+    // Unlike background retunes, it explicitly requests that AIrCon follow the new
+    // wave/profile even when the user had been browsing a different list.
+    private readonly Dictionary<string, DateTimeOffset> _programGuideFollowUntil = new(StringComparer.OrdinalIgnoreCase);
+    // ProgramGuide may tune before the newly opened ToolWindow has its first render.
+    private (string Wave, string Profile, DateTimeOffset Deadline)? _pendingProgramGuideInitialSelection;
     private readonly object _powerOffLock = new();
     private readonly Dictionary<string, PowerOffState> _powerOffStates = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, Timer> _powerOffTimers = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, ThreadingTimer> _powerOffTimers = new(StringComparer.OrdinalIgnoreCase);
     private long _powerOffGeneration;
     private readonly object _operationLock = new();
     private readonly Dictionary<string, long> _operationGenerations = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, SemaphoreSlim> _profileOperationGates = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, ProfileOperationGate> _profileOperationGates = new(StringComparer.OrdinalIgnoreCase);
 
     internal void ApplyRuntimeWindowLifecycle(TvAIrPlugin.Events.PluginEventEnvelope eventEnvelope)
     {
@@ -130,6 +236,11 @@ internal sealed class AIrConRenderer
         if (!lifecycle.PluginId.Equals(PluginId, StringComparison.OrdinalIgnoreCase))
             return;
 
+        if (lifecycle.State == TvAIrPlugin.Windows.PluginWindowLifecycleState.Shown)
+        {
+            ScheduleCurrentServiceCenter(lifecycle.WindowInstanceId, 550);
+            return;
+        }
         if (lifecycle.State is not (TvAIrPlugin.Windows.PluginWindowLifecycleState.Closing or TvAIrPlugin.Windows.PluginWindowLifecycleState.Closed))
             return;
 
@@ -166,29 +277,191 @@ internal sealed class AIrConRenderer
         return null;
     }
 
+    internal void BeginRuntimeUi()
+    {
+        Interlocked.Increment(ref _runtimeUiLifecycleVersion);
+        _runtimeUiStopped = false;
+    }
+
+    // The native Win32 foreground observer only reports activation of our own ToolWindow.
+    // No activation, focus, Host window inspection or scrolling is performed by the observer.
+    internal void OnOwnWindowForeground()
+    {
+        foreach (var windowId in SnapshotWindowDisplays().Select(pair => pair.Key))
+            ScheduleCurrentServiceCenter(windowId, 150);
+    }
+
+    private void ScheduleCurrentServiceCenter(string windowId, int delayMs, string? expectedServiceKey = null)
+    {
+        if (string.IsNullOrWhiteSpace(windowId) || _runtimeUiStopped) return;
+        var lifecycleVersion = CaptureRuntimeUiLifecycle();
+        CancellationTokenSource scheduled;
+        lock (_centerRequestLock)
+        {
+            if (_pendingCenterByWindow.Remove(windowId, out var previous))
+                previous.Cancel();
+            scheduled = new CancellationTokenSource();
+            _pendingCenterByWindow[windowId] = scheduled;
+        }
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(delayMs, scheduled.Token).ConfigureAwait(false);
+                // The document may still be navigating when the first callback arrives.
+                // Bounded retries allow the displayed WebBrowser to complete navigation.
+                for (var attempt = 1; attempt <= CenterScrollMaxAttempts; attempt++)
+                {
+                    scheduled.Token.ThrowIfCancellationRequested();
+                    if (!IsCurrentRuntimeUiLifecycle(lifecycleVersion)) return;
+                    var displayed = GetWindowDisplay(windowId);
+                    if (displayed == null || displayed.RenderVersion == 0
+                        || displayed.RequestedWave != null)
+                    {
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+                        SafeLog($"CENTER_SCROLL result=SKIPPED windowId={windowId} reason={(displayed == null || displayed.RenderVersion == 0 ? "display_unavailable" : "navigation_pending")} attempt={attempt}");
+#endif
+                        return;
+                    }
+                    // One canonical viewer-state snapshot per retry. The callback running on the
+                    // WinForms UI thread checks only the immutable per-window snapshot:
+                    // never perform a Host API lookup while the browser is being scrolled.
+                    var station = ResolveCurrentStation(displayed);
+                    if (station == null || !station.ServiceKey.Equals(displayed.ServiceKey, StringComparison.OrdinalIgnoreCase)
+                        || (expectedServiceKey != null &&
+                        !station.ServiceKey.Equals(expectedServiceKey, StringComparison.OrdinalIgnoreCase)))
+                    {
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+                        SafeLog($"CENTER_SCROLL result=SKIPPED windowId={windowId} wave={displayed.Wave} service={displayed.ServiceKey} attempt={attempt} reason={(station == null ? "no_visible_viewer" : "selection_changed")}");
+#endif
+                        return;
+                    }
+                    var key = station.ServiceKey;
+                    bool IsCurrentRender()
+                    {
+                        if (!IsCurrentRuntimeUiLifecycle(lifecycleVersion) || scheduled.IsCancellationRequested) return false;
+                        // Compare one immutable snapshot before and inside the UI callback;
+                        // no mixed wave/profile/version pair can escape this boundary.
+                        var currentDisplay = GetWindowDisplay(windowId);
+                        if (currentDisplay == null || currentDisplay.RequestedWave != null
+                            || currentDisplay.RenderVersion != displayed.RenderVersion
+                            || !currentDisplay.Wave.Equals(displayed.Wave, StringComparison.OrdinalIgnoreCase)
+                            || !currentDisplay.ViewerProfile.Equals(displayed.ViewerProfile, StringComparison.OrdinalIgnoreCase)) return false;
+                        // This is the canonical selected row already verified above.
+                        // A replacement render, navigation or selection invalidates it
+                        // without any synchronous Host call from the UI callback.
+                        return currentDisplay.ServiceKey.Equals(key, StringComparison.OrdinalIgnoreCase);
+                    }
+                    var result = await AirConForegroundObserver.CenterOwnListRowAsync(
+                        station.RowId, displayed.RenderVersion,
+                        IsCurrentRender, scheduled.Token).ConfigureAwait(false);
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+                    // A navigating WebBrowser may still contain the preceding DOM.
+                    // Report the final result rather than flood logs during navigation.
+                    if (result.Applied || attempt == CenterScrollMaxAttempts ||
+                        result.Reason is not ("document_not_ready" or "document_outdated" or "row_not_ready"))
+                        SafeLog($"CENTER_SCROLL result={(result.Applied ? "APPLIED" : "FAILED")} windowId={windowId} wave={station.Wave} service={station.ServiceKey} attempt={attempt} reason={result.Reason} target={result.TargetTop} actual={result.ActualTop} max={result.MaxTop}");
+#endif
+                    if (result.Applied || result.Reason is "superseded" or "control_missing" or "window_not_visible") return;
+                    if (attempt < CenterScrollMaxAttempts)
+                        await Task.Delay(CenterScrollRetryDelayMs, scheduled.Token).ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception)
+            {
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+                SafeLog("CENTER_SCROLL result=FAILED reason=unexpected_exception");
+#endif
+            }
+            finally
+            {
+                // A timed-out BeginInvoke can still be queued on the WinForms
+                // thread. Invalidate its callback before releasing our request:
+                // abandoned UI work must never scroll a later document.
+                scheduled.Cancel();
+                lock (_centerRequestLock)
+                {
+                    if (_pendingCenterByWindow.TryGetValue(windowId, out var current)
+                        && ReferenceEquals(current, scheduled))
+                        _pendingCenterByWindow.Remove(windowId);
+                }
+                scheduled.Dispose();
+            }
+        });
+    }
+
+    private CurrentStation? ResolveCurrentStation(string windowId)
+        => GetWindowDisplay(windowId) is { } displayed ? ResolveCurrentStation(displayed) : null;
+
+    private static CurrentStation? ResolveCurrentStation(WindowDisplayState displayed)
+    {
+        var wave = displayed.Wave;
+        var profile = displayed.ViewerProfile;
+        if (string.IsNullOrWhiteSpace(profile)) return null;
+        var session = AIrConNewApiBridge.ListSessions().FirstOrDefault(x =>
+            IsLiveViewerSession(x) && x.ViewerProfileId.Equals(profile, StringComparison.OrdinalIgnoreCase)
+            && x.CurrentService is { NetworkId: > 0, TransportStreamId: > 0, ServiceId: > 0 });
+        var identity = session?.CurrentService;
+        if (identity == null) return null;
+        var service = AIrConNewApiBridge.ListServices().FirstOrDefault(x =>
+            x.NetworkId == identity.NetworkId && x.TransportStreamId == identity.TransportStreamId
+            && x.ServiceId == identity.ServiceId);
+        if (service == null || !NormalizeWaveFilter(service.BroadcastType).Equals(NormalizeWaveFilter(wave), StringComparison.OrdinalIgnoreCase)) return null;
+        return new CurrentStation(NormalizeWaveFilter(wave), profile,
+            ServiceKey(identity.NetworkId, identity.TransportStreamId, identity.ServiceId),
+            BuildServiceDomId(identity.NetworkId, identity.TransportStreamId, identity.ServiceId));
+    }
+
     internal void StopRuntimeUi()
     {
+        _runtimeUiStopped = true;
+        Interlocked.Increment(ref _runtimeUiLifecycleVersion);
+        lock (_centerRequestLock)
+        {
+            foreach (var request in _pendingCenterByWindow.Values) request.Cancel();
+            _pendingCenterByWindow.Clear();
+        }
         lock (_zappingLock)
         {
-            foreach (var timer in _zappingTimers.Values) timer.Dispose();
-            _zappingTimers.Clear();
+            DisposeTimersAndClear(_zappingTimers);
             _zappingStates.Clear();
+            _programGuideFollowUntil.Clear();
+            _pendingProgramGuideInitialSelection = null;
         }
         lock (_powerOffLock)
         {
-            foreach (var timer in _powerOffTimers.Values) timer.Dispose();
-            _powerOffTimers.Clear();
+            DisposeTimersAndClear(_powerOffTimers);
             _powerOffStates.Clear();
         }
         lock (_operationLock)
         {
             _operationGenerations.Clear();
-            foreach (var gate in _profileOperationGates.Values) gate.Dispose();
+            // Retire every gate, but defer disposing its semaphore until all
+            // queued/in-flight users have released their acquired leases.
+            foreach (var gate in _profileOperationGates.Values)
+            {
+                gate.Retired = true;
+                if (gate.LeaseCount == 0) gate.Semaphore.Dispose();
+            }
             _profileOperationGates.Clear();
         }
-        lock (_lastWaveByWindowId) _lastWaveByWindowId.Clear();
-        lock (_lastViewerProfileByWindowId) _lastViewerProfileByWindowId.Clear();
-        lock (_renderedServiceByWindowId) _renderedServiceByWindowId.Clear();
+        lock (_windowDisplayLock) _windowDisplays.Clear();
+    }
+
+    // Call under the owning state lock. Remove scheduled callbacks before clearing state;
+    // a callback already queued must still pass its generation/state checks.
+    // Under the owning state lock, detach and dispose one scheduled timer.
+    // Generation/lifecycle checks still reject callbacks already queued.
+    private static void RemoveAndDisposeTimer(Dictionary<string, ThreadingTimer> timers, string key)
+    {
+        if (timers.Remove(key, out var timer)) timer.Dispose();
+    }
+
+    private static void DisposeTimersAndClear(Dictionary<string, ThreadingTimer> timers)
+    {
+        foreach (var timer in timers.Values) timer.Dispose();
+        timers.Clear();
     }
 
     public async Task<RuntimeUiActionResult> HandleActionAsync(RuntimeUiActionContext request, CancellationToken cancellationToken)
@@ -202,11 +475,8 @@ internal sealed class AIrConRenderer
                 var windowId = FirstNonEmpty(request.CurrentWindowId, PayloadValue(request, "windowId", "window-id", "currentWindowId", "current-window-id"));
                 var wave = NormalizeWaveFilter(PayloadValue(request, "wave"));
                 var viewerProfile = NormalizeViewerProfileId(PayloadValue(request, "viewerProfile", "viewer-profile"));
-                // browseWave is the list-only route. Wave buttons with a compatible Viewer Profile
-                // intentionally use the existing viewerActivate action instead (see BuildFilterForm).
-                // Do not activate/start/tune here: CATV or other waves lacking a viewer must remain browsable.
-                var route = BuildViewerContentRoute(wave, viewerProfile);
-                var refresh = AIrConNewApiBridge.RefreshToolWindow(windowId, route);
+                // No viewer is required for browsing. Do not activate, start or retune.
+                var refresh = RequestWaveNavigation(windowId, wave, viewerProfile);
                 return new RuntimeUiActionResult { Succeeded = refresh.Success, Message = refresh.Success ? "局一覧を表示" : "局一覧の更新に失敗しました。", Diagnostics = refresh.Diagnostics };
             }
             if (airconAction.Equals(AirConActionSettingsOpen, StringComparison.OrdinalIgnoreCase) ||
@@ -218,9 +488,9 @@ internal sealed class AIrConRenderer
                 var returnProfile = NormalizeViewerProfileId(PayloadValue(request, "returnViewerProfile", "return-viewer-profile", "viewerProfile", "viewer-profile"));
                 if (airconAction.Equals(AirConActionSettingsSave, StringComparison.OrdinalIgnoreCase))
                 {
-                    var remember = ParseBool(PayloadValue(request, "rememberWindowPlacement", "remember-window-placement"), false);
-                    var interval = NormalizeZappingInterval(PayloadValue(request, "zappingIntervalSeconds", "zapping-interval-seconds"));
-                    var startupWave = NormalizeWaveFilter(PayloadValue(request, "startupWave", "startup-wave"));
+                    var remember = ParseBool(PayloadValue(request, SettingRememberPlacement, "remember-window-placement"), DefaultRememberWindowPlacement);
+                    var interval = NormalizeZappingInterval(PayloadValue(request, SettingZappingIntervalSeconds, "zapping-interval-seconds"));
+                    var startupWave = NormalizeWaveFilter(PayloadValue(request, SettingStartupWave, "startup-wave"));
                     var saved = AIrConNewApiBridge.SaveSettings(remember, interval, startupWave);
                     if (!saved.Success)
                     {
@@ -250,8 +520,7 @@ internal sealed class AIrConRenderer
                     #if AIRCON_DEVELOPER_DIAGNOSTICS
                     SafeLog($"SETTINGS_SAVE_VERIFY result=OK writtenRemember={remember} readBackRemember={verifiedSettings.RememberWindowPlacement} writtenInterval={interval} readBackInterval={verifiedSettings.ZappingIntervalSeconds} writtenWave={startupWave} readBackWave={verifiedSettings.StartupWave}");
                     #endif
-                    var route = BuildViewerContentRoute(returnWave, returnProfile);
-                    var refresh = AIrConNewApiBridge.RefreshToolWindow(settingsWindowId, route);
+                    var refresh = RequestWindowDisplayNavigation(settingsWindowId, returnWave, returnProfile);
                     #if AIRCON_DEVELOPER_DIAGNOSTICS
                     SafeLog($"SETTINGS_SAVE result={(refresh.Success ? "OK" : "FAILED")} rememberPlacement={remember} zappingIntervalSeconds={interval} startupWave={startupWave} refresh={refresh.Diagnostics}");
                     #endif
@@ -262,7 +531,7 @@ internal sealed class AIrConRenderer
                 var targetRoute = airconAction.Equals(AirConActionSettingsOpen, StringComparison.OrdinalIgnoreCase)
                     ? "/plugin/aircon?view=settings&" + returnQuery
                     : BuildViewerContentRoute(returnWave, returnProfile);
-                var settingsRefresh = AIrConNewApiBridge.RefreshToolWindow(settingsWindowId, targetRoute);
+                var settingsRefresh = RequestWindowDisplayNavigation(settingsWindowId, returnWave, returnProfile, targetRoute);
                 #if AIRCON_DEVELOPER_DIAGNOSTICS
                 SafeLog($"SETTINGS_VIEW action={airconAction} result={(settingsRefresh.Success ? "OK" : "FAILED")} diagnostics={settingsRefresh.Diagnostics}");
                 #endif
@@ -271,7 +540,6 @@ internal sealed class AIrConRenderer
 
             if (airconAction.Equals(AirConActionZappingStart, StringComparison.OrdinalIgnoreCase) ||
                 airconAction.Equals(AirConActionZappingStop, StringComparison.OrdinalIgnoreCase) ||
-                airconAction.Equals(AirConActionZappingTick, StringComparison.OrdinalIgnoreCase) ||
                 airconAction.Equals(AirConActionPowerOffStart, StringComparison.OrdinalIgnoreCase) ||
                 airconAction.Equals(AirConActionPowerOffStop, StringComparison.OrdinalIgnoreCase) ||
                 airconAction.Equals(AirConActionViewerPowerOff, StringComparison.OrdinalIgnoreCase) ||
@@ -297,39 +565,39 @@ internal sealed class AIrConRenderer
                     // When a live session exists, activate only that exact profile; otherwise keep the
                     // selection successful so a subsequent manual double-click can start that profile.
                     var liveSession = AIrConNewApiBridge.ListSessions()
-                        .Where(x => x.ProcessId.HasValue)
-                        .Where(x => !x.State.Equals("stopped", StringComparison.OrdinalIgnoreCase))
-                        .Where(x => !x.State.Equals("closed", StringComparison.OrdinalIgnoreCase))
-                        .FirstOrDefault(x => x.ViewerProfileId.Equals(viewerProfile, StringComparison.OrdinalIgnoreCase));
-                    var contentRoute = BuildViewerContentRoute(wave, viewerProfile);
+                        .FirstOrDefault(x => IsLiveViewerSession(x)
+                            && x.ViewerProfileId.Equals(viewerProfile, StringComparison.OrdinalIgnoreCase));
                     if (liveSession == null)
                     {
-                        var refreshOnly = AIrConNewApiBridge.RefreshToolWindow(windowId, contentRoute);
+                        var refreshOnly = RequestWaveNavigation(windowId, wave, viewerProfile);
                         #if AIRCON_DEVELOPER_DIAGNOSTICS
                         SafeLog($"VIEWER_MANUAL_ACTIVATE viewerProfile={viewerProfile} wave={wave} result=SKIPPED reason=viewer_not_running selectionApplied=True refreshResult={(refreshOnly.Success ? "OK" : "FAILED")} refreshDiagnostics={refreshOnly.Diagnostics}");
                         #endif
                         return new RuntimeUiActionResult { Succeeded = refreshOnly.Success, Message = "視聴先を選択", Diagnostics = refreshOnly.Success ? "viewer_not_running_selection_applied_and_refreshed" : refreshOnly.Diagnostics };
                     }
 
-                    // Broadcast-wave buttons intentionally combine two user actions: browse the
-                    // selected wave's station list and focus its already-running compatible TVTest.
-                    // Browsing must work even without a viewer (for example, CATV service lists),
-                    // but removing viewer activation here would break the established wave-button UI.
-                    // Refresh the list before requesting activation, to reduce the risk that the
-                    // ToolWindow takes focus back. Host refresh may be asynchronous, so it cannot
-                    // itself guarantee the final foreground window. Do not start, tune or retune
-                    // TVTest from this button. Keep these invariants when changing CATV or layout.
+                    // A wave button changes only the list and may bring its existing viewer forward.
+                    // Observe foreground before navigation as well as afterwards: the Host may
+                    // asynchronously replace the browser document during a wave switch, and that
+                    // transient UI activity must not cause a second activation of a viewer that
+                    // was already foreground when the click was received.
                     var waveButtonClick = PayloadValue(request, "waveButton")
                         .Equals("true", StringComparison.OrdinalIgnoreCase);
-                    AIrConNewApiBridge.OperationResult? refresh = waveButtonClick
-                        ? AIrConNewApiBridge.RefreshToolWindow(windowId, contentRoute)
-                        : null;
-                    if (waveButtonClick && refresh is { Success: false } failedRefresh)
-                        return new RuntimeUiActionResult { Succeeded = false, Message = "局一覧の更新に失敗しました。", Diagnostics = failedRefresh.Diagnostics };
-                    var activated = await AIrConNewApiBridge.ActivateAsync(viewerProfile).ConfigureAwait(false);
-                    // In the non-wave-button route, refresh occurs after activation as before.
-                    // In the wave-button route, retain the earlier refresh result without repeating it.
-                    refresh ??= AIrConNewApiBridge.RefreshToolWindow(windowId, contentRoute);
+                    var targetPid = liveSession.ProcessId.GetValueOrDefault();
+                    var targetWasForeground = waveButtonClick && targetPid > 0
+                        && AirConForegroundObserver.IsViewerProcessForeground(targetPid);
+                    var refresh = waveButtonClick
+                        ? RequestWaveNavigation(windowId, wave, viewerProfile)
+                        : AIrConNewApiBridge.OperationResult.Ok("navigation_not_requested");
+                    if (!refresh.Success)
+                        return new RuntimeUiActionResult { Succeeded = false, Message = "局一覧の更新に失敗しました。", Diagnostics = refresh.Diagnostics };
+                    var foregroundAlreadyTarget = waveButtonClick && (targetWasForeground ||
+                        (targetPid > 0 && AirConForegroundObserver.IsViewerProcessForeground(targetPid)));
+                    var activated = foregroundAlreadyTarget
+                        ? AIrConNewApiBridge.OperationResult.Ok("viewer_already_foreground")
+                        : await AIrConNewApiBridge.ActivateAsync(liveSession.ViewerSessionId, liveSession.Generation).ConfigureAwait(false);
+                    if (!waveButtonClick)
+                        refresh = RequestWindowDisplayNavigation(windowId, wave, viewerProfile);
                     var recoveredNotRunning = activated.Success && activated.Diagnostics.Equals("viewer_process_exited_recovered", StringComparison.OrdinalIgnoreCase);
                     var success = activated.Success && refresh.Success;
                     #if AIRCON_DEVELOPER_DIAGNOSTICS
@@ -340,7 +608,7 @@ internal sealed class AIrConRenderer
                     return new RuntimeUiActionResult
                     {
                         Succeeded = success,
-                        Message = recoveredNotRunning && success ? "視聴先を選択" : success ? "TVTestを前面化" : (!activated.Success ? activated.Message : "AIrCon画面更新失敗"),
+                        Message = recoveredNotRunning && success ? "視聴先を選択" : success ? (foregroundAlreadyTarget ? "局一覧を表示" : "TVTestを前面化") : (!activated.Success ? activated.Message : "AIrCon画面更新失敗"),
                         Diagnostics = recoveredNotRunning && success ? "viewer_not_running_selection_applied_and_refreshed" : !activated.Success ? activated.Diagnostics : refresh.Diagnostics
                     };
                 }
@@ -395,15 +663,26 @@ internal sealed class AIrConRenderer
                     if (!int.TryParse(nidText, out var nid) || !int.TryParse(tsidText, out var tsid) || !int.TryParse(sidText, out var sid))
                         return new RuntimeUiActionResult { Succeeded = false, Message = "このチャンネルは現在視聴できません。", Diagnostics = "viewer_identity_invalid" };
                     var tuned = await SwitchViewerServiceAsync(viewerProfile, wave, nid, tsid, sid, "manual_dblclick", TvAirViewerActivation.Activate).ConfigureAwait(false);
+                    // ViewerSessionChanged is the sole display-update authority for both
+                    // existing retunes and first launches. The event decides whether the
+                    // current HTML needs one full render to enable Viewer controls.
+                    // Re-selecting the already tuned station emits no session change;
+                    // recenter its existing row without navigating.
+                    var selectedKey = ServiceKey(nid, tsid, sid);
+                    if (tuned.Success
+                        && GetRenderedServiceKey(windowId).Equals(selectedKey, StringComparison.OrdinalIgnoreCase))
+                        ScheduleCurrentServiceCenter(windowId, 100, selectedKey);
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+                    SafeLog($"VIEWER_MANUAL_PRESENTATION result={(tuned.Success ? "EVENT_OWNED" : "FAILED")} profile={viewerProfile} service={selectedKey} generation={tuned.Generation} refreshRequested=False");
+#endif
                     return new RuntimeUiActionResult
                     {
                         Succeeded = tuned.Success,
                         Message = tuned.Success ? "選局" : tuned.Message,
                         Diagnostics = tuned.Diagnostics,
-                        RefreshRequested = tuned.Success,
+                        RefreshRequested = false,
                         RefreshTarget = "content",
-                        PreserveScroll = false,
-                        ContentRoute = BuildViewerContentRoute(wave, viewerProfile)
+                        PreserveScroll = true
                     };
                 }
 
@@ -418,7 +697,7 @@ internal sealed class AIrConRenderer
                         Succeeded = true,
                         Message = "ザッピング停止",
                         Diagnostics = "zapping_stopped",
-                        UiPatches = BuildZappingUiPatches(false, wave)
+                        UiPatches = BuildZappingUiPatches(false, wave, windowId)
                     };
                 }
 
@@ -442,14 +721,14 @@ internal sealed class AIrConRenderer
                             Succeeded = true,
                             Message = $"巡回中（{existing.Wave}）",
                             Diagnostics = "zapping_already_active",
-                            UiPatches = BuildZappingUiPatches(true, existing.Wave)
+                            UiPatches = BuildZappingUiPatches(true, existing.Wave, windowId)
                         };
                     }
                     var liveSession = AIrConNewApiBridge.ListSessions().FirstOrDefault(x =>
-                        x.ViewerProfileId.Equals(viewerProfile, StringComparison.Ordinal) &&
-                        !string.IsNullOrWhiteSpace(x.ViewerSessionId) &&
-                        x.Generation > 0 &&
-                        x.ProcessId is > 0);
+                        IsLiveViewerSession(x)
+                        && x.ViewerProfileId.Equals(viewerProfile, StringComparison.OrdinalIgnoreCase)
+                        && !string.IsNullOrWhiteSpace(x.ViewerSessionId)
+                        && x.Generation > 0);
                     if (liveSession is null)
                     {
                         #if AIRCON_DEVELOPER_DIAGNOSTICS
@@ -460,7 +739,7 @@ internal sealed class AIrConRenderer
                             Succeeded = true,
                             Message = "視聴中のTVTestがありません",
                             Diagnostics = "zapping_not_started_viewer_not_running",
-                            UiPatches = BuildZappingUiPatches(false, wave)
+                            UiPatches = BuildZappingUiPatches(false, wave, windowId)
                         };
                     }
 
@@ -476,13 +755,13 @@ internal sealed class AIrConRenderer
                         Succeeded = true,
                         Message = $"巡回中（{started.Wave}）",
                         Diagnostics = "zapping_started_waiting_first_interval",
-                        UiPatches = BuildZappingUiPatches(true, started.Wave)
+                        UiPatches = BuildZappingUiPatches(true, started.Wave, windowId)
                     };
                 }
 
                 if (airconAction.Equals(AirConActionViewerPowerOff, StringComparison.OrdinalIgnoreCase))
                 {
-                    var stopResult = await CompleteShutdownAsync(viewerProfile, windowId, "toolbar_power").ConfigureAwait(false);
+                    var stopResult = await CompleteShutdownAsync(viewerProfile, "toolbar_power").ConfigureAwait(false);
                     var stopped = stopResult.Success;
                     #if AIRCON_DEVELOPER_DIAGNOSTICS
                     SafeLog($"VIEWER_POWER_OFF viewerProfile={viewerProfile} result={(stopped ? "OK" : "FAILED")} message={stopResult.Message}");
@@ -522,8 +801,8 @@ internal sealed class AIrConRenderer
                     };
                 }
 
-                var tick = await RunZappingTickAsync(viewerProfile, null, "plugin_action").ConfigureAwait(false);
-                return new RuntimeUiActionResult { Succeeded = tick.Success, Message = tick.Success ? "ザッピング中" : "ザッピング停止", Diagnostics = tick.Diagnostics };
+                // Every accepted viewer action must have an explicit handler.
+                return new RuntimeUiActionResult { Succeeded = false, Message = "操作できませんでした。", Diagnostics = "action_not_supported" };
             }
 
             #if AIRCON_DEVELOPER_DIAGNOSTICS
@@ -540,4247 +819,4 @@ internal sealed class AIrConRenderer
         }
     }
 
-    private static IReadOnlyList<RuntimeUiPatch> BuildZappingUiPatches(bool active, string wave)
-    {
-        var normalizedWave = NormalizeWaveFilter(wave);
-        var nextOperation = active ? AirConActionZappingStop : AirConActionZappingStart;
-        var intervalSeconds = GetZappingIntervalSeconds();
-        return new RuntimeUiPatch[]
-        {
-            RuntimeUiPatch.Text("aircon-zapping-status", active ? $"巡回中（{normalizedWave}）" : "停止中"),
-            RuntimeUiPatch.Classes("aircon-zapping-status",
-                add: new[] { active ? "aircon-zapping-status-on" : "aircon-zapping-status-off" },
-                remove: new[] { active ? "aircon-zapping-status-off" : "aircon-zapping-status-on" }),
-            RuntimeUiPatch.Text("aircon-zapping-button", active ? "停止" : "開始"),
-            RuntimeUiPatch.Classes("aircon-zapping-button",
-                add: active ? new[] { "aircon-zapping-button-on" } : Array.Empty<string>(),
-                remove: active ? Array.Empty<string>() : new[] { "aircon-zapping-button-on" }),
-            // The zapping state becomes authoritative at Start/Stop action completion, before the
-            // first timer-driven retune. Keep the current Viewer row's semantic class in the same
-            // declarative patch transaction so visual state never lags the automation state.
-            RuntimeUiPatch.Classes(CurrentViewingAnchorId,
-                add: new[] { active ? "aircon-row-zapping-selected" : "aircon-row-viewing-selected" },
-                remove: new[] { active ? "aircon-row-viewing-selected" : "aircon-row-zapping-selected" }),
-            new RuntimeUiPatch
-            {
-                ElementId = "aircon-zapping-button",
-                Attributes = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
-                {
-                    ["title"] = active ? "ザッピングを停止" : $"{intervalSeconds}秒ごとに同じ放送波内で順送りします",
-                    ["data-tvair-payload-operation"] = nextOperation,
-                    ["data-tvair-payload-airconaction"] = nextOperation
-                }
-            },
-            new RuntimeUiPatch
-            {
-                ElementId = "aircon-zapping-bar",
-                Attributes = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
-                {
-                    ["data-aircon-zapping-active"] = active ? BoolTrue : BoolFalse,
-                    ["data-aircon-zapping-wave"] = normalizedWave
-                }
-            }
-        };
-    }
-
-    private static IReadOnlyList<RuntimeUiPatch> BuildPowerOffUiPatches(bool active, int hours)
-    {
-        var normalizedHours = Math.Max(1, Math.Min(6, hours));
-        var nextOperation = active ? AirConActionPowerOffStop : AirConActionPowerOffStart;
-        return new RuntimeUiPatch[]
-        {
-            RuntimeUiPatch.Text("aircon-sleep-label", active ? "終了まで" : "電源OFF"),
-            RuntimeUiPatch.Visibility("aircon-sleep-select", visible: !active),
-            RuntimeUiPatch.Visibility("aircon-sleep-remaining", visible: active),
-            RuntimeUiPatch.Text("aircon-sleep-remaining", normalizedHours.ToString(System.Globalization.CultureInfo.InvariantCulture) + "h"),
-            RuntimeUiPatch.Text("aircon-sleep-button", active ? "停止" : "開始"),
-            RuntimeUiPatch.Classes("aircon-sleep-button",
-                add: active ? new[] { "aircon-sleep-button-on" } : Array.Empty<string>(),
-                remove: active ? Array.Empty<string>() : new[] { "aircon-sleep-button-on" }),
-            new RuntimeUiPatch
-            {
-                ElementId = "aircon-sleep-button",
-                Attributes = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
-                {
-                    ["title"] = active ? "終了タイマーを停止" : "選択中TVTestの終了タイマーを開始",
-                    ["data-tvair-payload-operation"] = nextOperation
-                }
-            }
-        };
-    }
-
-    public string RenderHtml(RuntimeUiRenderContext context)
-    {
-        try
-        {
-            var isToolWindow = IsToolWindow(context);
-            var query = ExtractQueryDictionary(context);
-            var requestedWave = QueryString(query, "wave");
-            var requestedView = QueryString(query, "view");
-            var windowIdForWave = QueryWindowId(context);
-            if (isToolWindow) PruneSupersededWindowState(windowIdForWave);
-            var filter = ResolveEffectiveWave(requestedWave, windowIdForWave, isToolWindow);
-            if (isToolWindow && requestedView.Equals("settings", StringComparison.OrdinalIgnoreCase))
-            {
-                var settingsAction = CaptureAction(context);
-                var settingsWindow = CaptureWindow(context, true);
-                var returnWave = NormalizeWaveFilter(QueryString(query, "returnWave"));
-                var returnViewerProfile = NormalizeViewerProfileId(QueryString(query, "returnViewerProfile"));
-                return BuildSettingsHtml(context, settingsAction, settingsWindow, AIrConNewApiBridge.LoadSettings(), returnWave, returnViewerProfile);
-            }
-            RememberWave(windowIdForWave, filter, isToolWindow);
-            var selectedTunerValue = "auto";
-            var action = CaptureAction(context);
-            var window = CaptureWindow(context, isToolWindow);
-            var alwaysOnTop = ResolveWindowAlwaysOnTop(context, window, isToolWindow);
-            var viewerProfiles = CaptureViewerProfiles(context);
-            var requestedViewerProfile = ResolveRequestedViewerProfile(query, windowIdForWave);
-            var selectedViewerProfile = ResolveSelectedViewerProfile(requestedViewerProfile, viewerProfiles, filter);
-            RememberViewerProfile(windowIdForWave, selectedViewerProfile.Value, isToolWindow);
-            var focusTriplet = new FocusTriplet(null, null, null);
-            var activeZappingState = GetActiveZappingState(selectedViewerProfile.Value);
-            var zappingActive = activeZappingState != null;
-            var activeZappingWave = activeZappingState?.Wave ?? string.Empty;
-            if (zappingActive && activeZappingWave.Equals(filter, StringComparison.OrdinalIgnoreCase)) UpdateZappingWindowSubscription(selectedViewerProfile.Value, windowIdForWave, filter);
-            var powerOffDeadline = ResolvePowerOffDeadline(selectedViewerProfile.Value);
-            var data = CaptureData(filter, viewerProfiles, focusTriplet);
-            // A saved wave may no longer have any configured service. Select a visible
-            // wave from the same Host channel snapshot; never infer reception from tuners.
-            var visibleWaves = CanonicalWaveFilters(data.WaveFilters);
-            if (visibleWaves.Count > 0 && !visibleWaves.Any(x => x.Group.Equals(filter, StringComparison.OrdinalIgnoreCase)))
-            {
-                filter = visibleWaves[0].Group;
-                RememberWave(windowIdForWave, filter, isToolWindow);
-                selectedViewerProfile = ResolveSelectedViewerProfile(requestedViewerProfile, viewerProfiles, filter);
-                RememberViewerProfile(windowIdForWave, selectedViewerProfile.Value, isToolWindow);
-                activeZappingState = GetActiveZappingState(selectedViewerProfile.Value);
-                zappingActive = activeZappingState != null;
-                activeZappingWave = activeZappingState?.Wave ?? string.Empty;
-                if (zappingActive && activeZappingWave.Equals(filter, StringComparison.OrdinalIgnoreCase))
-                    UpdateZappingWindowSubscription(selectedViewerProfile.Value, windowIdForWave, filter);
-                powerOffDeadline = ResolvePowerOffDeadline(selectedViewerProfile.Value);
-                data = CaptureData(filter, viewerProfiles, focusTriplet);
-            }
-            // Capture the displayed state, not merely the latest Host session. A retune
-            // occurring through the TvAIr program guide otherwise leaves the old row
-            // selected until some unrelated UI navigation happens.
-            if (isToolWindow && !string.IsNullOrWhiteSpace(windowIdForWave))
-            {
-                var shownSession = data.ViewerSessions.FirstOrDefault(x =>
-                    x.IsActive && x.ViewerProfile.Equals(selectedViewerProfile.Value, StringComparison.OrdinalIgnoreCase));
-                var shownService = shownSession is { NetworkId: > 0, TransportStreamId: > 0, ServiceId: > 0 }
-                    ? ServiceKey(shownSession.NetworkId.Value, shownSession.TransportStreamId.Value, shownSession.ServiceId.Value)
-                    : string.Empty;
-                lock (_renderedServiceByWindowId) _renderedServiceByWindowId[windowIdForWave] = shownService;
-            }
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog($"RenderHtml route=aircon mode=viewer_current toolWindow={isToolWindow} requestedWave={requestedWave} effectiveWave={filter} viewerProfile={selectedViewerProfile.Value} selectorVisible={viewerProfiles.SelectorVisibleRecommended} profiles={viewerProfiles.SelectableProfiles.Count} services={data.Services.Count} viewers={data.ViewerSessions.Count} activeViewers={data.ViewerSessions.Count(x => x.IsActive)} highlighted={data.Services.Count(x => x.IsViewing)} projectionUsed={data.ProjectionUsed}");
-            #endif
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            if (zappingActive) SafeLog($"ZAPPING_STATE active windowId={windowIdForWave} activeWave={activeZappingWave} displayedWave={filter} viewerProfile={selectedViewerProfile.Value} services={data.Services.Count} intervalSeconds={activeZappingState!.IntervalSeconds}");
-            #endif
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            else if (QueryString(query, "zapping").Equals("off", StringComparison.OrdinalIgnoreCase)) SafeLog($"ZAPPING_STATE stopped windowId={windowIdForWave} wave={filter} viewerProfile={selectedViewerProfile.Value}");
-            #endif
-
-            return isToolWindow
-                ? BuildFloatingViewerHtml(context, data, action, window, filter, selectedTunerValue, selectedViewerProfile, alwaysOnTop, zappingActive, activeZappingWave, powerOffDeadline)
-                : BuildLauncherHtml(context, data, window, filter, selectedTunerValue, selectedViewerProfile.Value, alwaysOnTop);
-        }
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-        catch (Exception ex)
-#else
-        catch (Exception)
-#endif
-        {
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog("RenderHtml failed: " + ex.GetType().Name + " " + ex.Message);
-            #endif
-            return BuildRenderFailureHtml(context);
-        }
-    }
-
-    private string ResolveEffectiveWave(string requestedWave, string windowId, bool isToolWindow)
-    {
-        var normalized = NormalizeWaveFilter(requestedWave);
-        if (!string.IsNullOrWhiteSpace(requestedWave)) return normalized;
-        if (isToolWindow && !string.IsNullOrWhiteSpace(windowId))
-        {
-            lock (_lastWaveByWindowId)
-            {
-                if (_lastWaveByWindowId.TryGetValue(windowId, out var remembered) && !string.IsNullOrWhiteSpace(remembered)) return NormalizeWaveFilter(remembered);
-            }
-        }
-        return AIrConNewApiBridge.LoadSettings().StartupWave;
-    }
-
-    private static int GetZappingIntervalSeconds() => AIrConNewApiBridge.LoadSettings().ZappingIntervalSeconds;
-
-    private static bool ParseBool(string value, bool fallback)
-    {
-        return bool.TryParse(value, out var parsed) ? parsed : value == "1" ? true : value == "0" ? false : fallback;
-    }
-
-    private static int NormalizeZappingInterval(string value)
-    {
-        return int.TryParse(value, out var parsed) && parsed is 30 or 60 or 90 or 120 or 180 ? parsed : DefaultZappingIntervalSeconds;
-    }
-
-    private void RememberWave(string windowId, string wave, bool isToolWindow)
-    {
-        if (!isToolWindow || string.IsNullOrWhiteSpace(windowId)) return;
-        var normalized = NormalizeWaveFilter(wave);
-        lock (_lastWaveByWindowId) _lastWaveByWindowId[windowId] = normalized;
-    }
-
-    private bool IsWindowDisplaying(string windowId, string wave, string viewerProfile)
-    {
-        if (string.IsNullOrWhiteSpace(windowId) || string.IsNullOrWhiteSpace(viewerProfile)) return false;
-        string displayedWave;
-        string displayedProfile;
-        lock (_lastWaveByWindowId)
-        {
-            if (!_lastWaveByWindowId.TryGetValue(windowId, out displayedWave!)) return false;
-        }
-        lock (_lastViewerProfileByWindowId)
-        {
-            if (!_lastViewerProfileByWindowId.TryGetValue(windowId, out displayedProfile!)) return false;
-        }
-        return NormalizeWaveFilter(displayedWave).Equals(NormalizeWaveFilter(wave), StringComparison.OrdinalIgnoreCase)
-            && displayedProfile.Equals(viewerProfile, StringComparison.OrdinalIgnoreCase);
-    }
-
-    private ZappingState? GetActiveZappingState(string viewerProfile)
-    {
-        var key = BuildZappingKey(viewerProfile);
-        lock (_zappingLock)
-        {
-            return _zappingStates.TryGetValue(key, out var state) && state.Active ? state : null;
-        }
-    }
-
-    private void UpdateZappingWindowSubscription(string viewerProfile, string windowId, string wave)
-    {
-        if (string.IsNullOrWhiteSpace(windowId)) return;
-        var key = BuildZappingKey(viewerProfile);
-        lock (_zappingLock)
-        {
-            if (!_zappingStates.TryGetValue(key, out var state) || !state.Active) return;
-            if (!state.Wave.Equals(NormalizeWaveFilter(wave), StringComparison.OrdinalIgnoreCase)) return;
-            if (state.WindowId.Equals(windowId, StringComparison.OrdinalIgnoreCase)) return;
-            _zappingStates[key] = state with { WindowId = windowId };
-        }
-    }
-
-    private ZappingState EnsureZappingActive(string windowId, string wave, string viewerProfile)
-    {
-        var key = BuildZappingKey(viewerProfile);
-        lock (_zappingLock)
-        {
-            if (_zappingStates.TryGetValue(key, out var existing) && existing.Active) return existing;
-            var liveSession = AIrConNewApiBridge.ListSessions().FirstOrDefault(x => x.ViewerProfileId.Equals(viewerProfile, StringComparison.Ordinal));
-            if (liveSession is null || string.IsNullOrWhiteSpace(liveSession.ViewerSessionId) || liveSession.Generation <= 0 || liveSession.ProcessId is null or <= 0)
-                throw new InvalidOperationException("ザッピング対象の視聴状態を確認できません。");
-            var generation = NextOperationGeneration(viewerProfile);
-            var now = DateTimeOffset.Now;
-            var intervalSeconds = GetZappingIntervalSeconds();
-
-            // The first scheduled tick must advance from the service that is already being viewed.
-            // Do not rely on the rendered service projection's IsViewing flag here: the AIrCon
-            // window can display another wave/profile while this Viewer continues zapping in the
-            // background.  The Runtime Viewer Session is the authoritative current-service source.
-            var currentServiceKey = liveSession.CurrentService is { NetworkId: > 0, TransportStreamId: > 0, ServiceId: > 0 } currentService
-                ? ServiceKey(currentService.NetworkId, currentService.TransportStreamId, currentService.ServiceId)
-                : string.Empty;
-
-            var created = new ZappingState(true, now, DateTimeOffset.MinValue, now.AddSeconds(intervalSeconds), currentServiceKey, windowId ?? string.Empty, NormalizeWaveFilter(wave), viewerProfile, generation, liveSession.ViewerSessionId, liveSession.Generation, liveSession.ProcessId.Value, intervalSeconds);
-            _zappingStates[key] = created;
-            ScheduleNextZappingTickLocked(key, created);
-            return created;
-        }
-    }
-
-    private async Task StopZappingAsync(string viewerProfile)
-    {
-        NextOperationGeneration(viewerProfile);
-        RemoveZappingState(viewerProfile);
-
-        // Drain any dispatch already in flight. A queued old tick will fail its generation check.
-        var gate = GetProfileOperationGate(viewerProfile);
-        await gate.WaitAsync().ConfigureAwait(false);
-        gate.Release();
-    }
-
-    private void RemoveZappingState(string viewerProfile)
-    {
-        var key = BuildZappingKey(viewerProfile);
-        lock (_zappingLock)
-        {
-            _zappingStates.Remove(key);
-            _zappingOwnRetunes.Remove(key);
-            if (_zappingTimers.Remove(key, out var timer)) timer.Dispose();
-        }
-    }
-
-    private void ScheduleNextZappingTickLocked(string key, ZappingState state)
-    {
-        if (_zappingTimers.Remove(key, out var oldTimer)) oldTimer.Dispose();
-        var due = state.NextTickAt - DateTimeOffset.Now;
-        if (due < TimeSpan.Zero) due = TimeSpan.Zero;
-        _zappingTimers[key] = new Timer(
-            _ => _ = RunZappingTickAsync(state.ViewerProfile, state.Generation, "server_timer"),
-            null,
-            due,
-            Timeout.InfiniteTimeSpan);
-    }
-
-    private async Task<ZappingTickResult> RunZappingTickAsync(string viewerProfile, long? expectedGeneration, string source)
-    {
-        var gate = GetProfileOperationGate(viewerProfile);
-        await gate.WaitAsync().ConfigureAwait(false);
-        try
-        {
-            var key = BuildZappingKey(viewerProfile);
-            ZappingState state;
-            lock (_zappingLock)
-            {
-                if (!_zappingStates.TryGetValue(key, out state!) || !state.Active ||
-                    (expectedGeneration.HasValue && state.Generation != expectedGeneration.Value) ||
-                    state.Generation != CurrentOperationGeneration(viewerProfile))
-                {
-                    #if AIRCON_DEVELOPER_DIAGNOSTICS
-                    SafeLog($"ZAPPING_TICK skipped reason=inactive_or_superseded viewerProfile={viewerProfile} source={source}");
-                    #endif
-                    return new ZappingTickResult(false, "zapping_inactive_or_superseded");
-                }
-            }
-
-            var wave = state.Wave;
-            var windowId = state.WindowId;
-
-            // Lifecycle Shown/Closing/Closed owns window liveness. Do not issue a
-            // presentation refresh merely to probe the zapping owner's window:
-            // ViewerSessionChanged and the successful tick already refresh the view.
-
-            var liveSession = AIrConNewApiBridge.ListSessions().FirstOrDefault(x =>
-                x.ViewerSessionId.Equals(state.ViewerSessionId, StringComparison.Ordinal));
-            if (liveSession is null ||
-                !liveSession.ViewerProfileId.Equals(viewerProfile, StringComparison.Ordinal) ||
-                liveSession.ProcessId != state.ProcessId || liveSession.Generation <= 0)
-            {
-                RemoveZappingState(viewerProfile);
-                #if AIRCON_DEVELOPER_DIAGNOSTICS
-                SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=viewer_identity_changed expectedSession={state.ViewerSessionId} expectedPid={state.ProcessId}");
-                #endif
-                return new ZappingTickResult(false, "zapping_viewer_identity_changed");
-            }
-
-            // A Host retune on the same Viewer session/PID advances the session generation.
-            // Follow its authoritative service so the next tick advances from that channel.
-            // Never transfer zapping to another session or process.
-            if (liveSession.Generation != state.ViewerGeneration)
-            {
-                var current = liveSession.CurrentService;
-                var currentWave = current is { NetworkId: > 0, TransportStreamId: > 0, ServiceId: > 0 }
-                    ? ResolveServiceWave(current)
-                    : string.Empty;
-                if (!NormalizeWaveFilter(currentWave).Equals(wave, StringComparison.OrdinalIgnoreCase))
-                {
-                    RemoveZappingState(viewerProfile);
-                    #if AIRCON_DEVELOPER_DIAGNOSTICS
-                    SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=viewer_wave_changed expectedWave={wave} actualWave={currentWave}");
-                    #endif
-                    return new ZappingTickResult(false, "zapping_viewer_wave_changed");
-                }
-                var currentKey = ServiceKey(current!.NetworkId, current.TransportStreamId, current.ServiceId);
-                lock (_zappingLock)
-                {
-                    if (!_zappingStates.TryGetValue(key, out var latest) ||
-                        !latest.Active || latest.Generation != state.Generation)
-                        return new ZappingTickResult(false, "zapping_superseded");
-                    state = latest with { ViewerGeneration = liveSession.Generation, LastServiceKey = currentKey };
-                    _zappingStates[key] = state;
-                }
-                #if AIRCON_DEVELOPER_DIAGNOSTICS
-                SafeLog($"ZAPPING_STATE resynced viewerProfile={viewerProfile} session={state.ViewerSessionId} pid={state.ProcessId} generation={state.ViewerGeneration} service={currentKey} source=host_retune_same_identity");
-                #endif
-            }
-
-            var services = CaptureServiceProjection(wave)
-                .Where(HasResolvedTriplet)
-                .OrderBy(x => x.ProgramGuideOrder)
-                .ToList();
-            if (services.Count == 0)
-            {
-                #if AIRCON_DEVELOPER_DIAGNOSTICS
-                SafeLog($"ZAPPING_TICK failed reason=no_services windowId={windowId} wave={wave} viewerProfile={viewerProfile} source={source}");
-                #endif
-                RemoveZappingState(viewerProfile);
-                #if AIRCON_DEVELOPER_DIAGNOSTICS
-                SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=no_services");
-                #endif
-                return new ZappingTickResult(false, "zapping_no_services");
-            }
-
-            var lastIndex = -1;
-            if (!string.IsNullOrWhiteSpace(state.LastServiceKey))
-            {
-                lastIndex = services.FindIndex(x => ServiceKey(x.NetworkId, x.TransportStreamId, x.ServiceId).Equals(state.LastServiceKey, StringComparison.OrdinalIgnoreCase));
-            }
-            if (lastIndex < 0)
-            {
-                lastIndex = services.FindIndex(x => x.IsViewing && (string.IsNullOrWhiteSpace(x.ViewingViewerProfile) || x.ViewingViewerProfile.Equals(viewerProfile, StringComparison.OrdinalIgnoreCase)));
-            }
-
-            var nextIndex = (lastIndex + 1) % services.Count;
-            var target = services[nextIndex];
-
-            // Stop/shutdown may have superseded this tick while channel data was being captured.
-            if (!IsCurrentZappingGeneration(viewerProfile, state.Generation))
-            {
-                #if AIRCON_DEVELOPER_DIAGNOSTICS
-                SafeLog($"ZAPPING_TICK skipped reason=superseded_before_dispatch viewerProfile={viewerProfile} generation={state.Generation} source={source}");
-                #endif
-                return new ZappingTickResult(false, "zapping_superseded");
-            }
-
-            // An exact next-generation acknowledgment identifies only this tick's retune.
-            // Install it BEFORE dispatch because ViewerSessionChanged may be delivered
-            // synchronously inside the Host operation. It remains valid for delayed delivery.
-            var expectedServiceKey = ServiceKey(target.NetworkId, target.TransportStreamId, target.ServiceId);
-            lock (_zappingLock)
-                _zappingOwnRetunes[key] = (state.ViewerSessionId, liveSession.Generation + 1, expectedServiceKey);
-            var result = await SwitchViewerServiceCoreAsync(
-                viewerProfile,
-                wave,
-                target.NetworkId,
-                target.TransportStreamId,
-                target.ServiceId,
-                "zapping_" + source,
-                TvAirViewerActivation.Preserve,
-                () => IsCurrentZappingGeneration(viewerProfile, state.Generation)).ConfigureAwait(false);
-            var mayContinue = result.OperationCompleted && result.ContinuationRecommended;
-            if (!mayContinue || !string.Equals(result.ViewerSessionId, state.ViewerSessionId, StringComparison.Ordinal) ||
-                result.Generation != liveSession.Generation + 1)
-            {
-                // Unexpected Host result: let any later event refresh normally.
-                lock (_zappingLock) _zappingOwnRetunes.Remove(key);
-            }
-            var serviceKey = mayContinue
-                ? ServiceKey(target.NetworkId, target.TransportStreamId, target.ServiceId)
-                : state.LastServiceKey;
-            if (mayContinue)
-            {
-                var replacement = FindActiveViewerSession(viewerProfile);
-                if (replacement == null || string.IsNullOrWhiteSpace(replacement.ViewerSessionId) || replacement.ProcessId.GetValueOrDefault() <= 0)
-                {
-                    RemoveZappingState(viewerProfile);
-                    #if AIRCON_DEVELOPER_DIAGNOSTICS
-                    SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=replacement_identity_missing");
-                    #endif
-                    return new ZappingTickResult(false, "zapping_replacement_identity_missing");
-                }
-                var replacementProcessId = replacement.ProcessId.GetValueOrDefault();
-                ScheduleZappingAfterAttempt(viewerProfile, state.Generation, serviceKey, replacement.ViewerSessionId, replacement.Generation, replacementProcessId);
-            }
-            else
-            {
-                RemoveZappingState(viewerProfile);
-                #if AIRCON_DEVELOPER_DIAGNOSTICS
-                SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=switch_failed diagnostics={result.Diagnostics}");
-                #endif
-            }
-
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog($"ZAPPING_TICK result={(mayContinue ? (result.HasWarning ? "WARNING" : "OK") : "FAILED")} source={source} windowId={windowId} wave={wave} viewerProfile={viewerProfile} generation={state.Generation} index={nextIndex + 1}/{services.Count} service={target.ServiceName} nid={target.NetworkId} tsid={target.TransportStreamId} sid={target.ServiceId} authoritativeService={serviceKey} operationCompleted={result.OperationCompleted} hasWarning={result.HasWarning} continuationRecommended={result.ContinuationRecommended} message={result.Message}");
-            #endif
-            if (mayContinue)
-            {
-                // Keep the visible zapping wave current without activating or revealing AIrCon.
-                // When another wave/profile is displayed, update only the Viewer state and leave
-                // the current content untouched; selecting the zapping wave later performs one
-                // fresh render and centers the authoritative current Viewer row.
-                if (IsWindowDisplaying(windowId, wave, viewerProfile))
-                {
-                    var refresh = AIrConNewApiBridge.RefreshToolWindow(windowId, null);
-                    #if AIRCON_DEVELOPER_DIAGNOSTICS
-                    SafeLog($"ZAPPING_REFRESH result={(refresh.Success ? "OK" : "FAILED")} mode=visible_profile windowId={windowId} wave={wave} viewerProfile={viewerProfile} diagnostics={refresh.Diagnostics}");
-                    #endif
-                    if (!refresh.Success && IsDefinitiveWindowGone(refresh.Diagnostics))
-                    {
-                        RemoveZappingState(viewerProfile);
-                        StopPowerOffForWindow(viewerProfile, windowId);
-                        #if AIRCON_DEVELOPER_DIAGNOSTICS
-                        SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=refresh_target_not_found windowId={windowId} diagnostics={refresh.Diagnostics} backgroundExecution=StopWithWindow");
-                        #endif
-                    }
-                }
-                else
-                {
-                    #if AIRCON_DEVELOPER_DIAGNOSTICS
-                    SafeLog($"ZAPPING_BACKGROUND_SYNC result=OK windowId={windowId} wave={wave} viewerProfile={viewerProfile} service={target.ServiceName} action=state_updated_visible_content_unchanged");
-                    #endif
-                }
-            }
-            return new ZappingTickResult(result.Success, result.Success ? "zapping_tick_ok" : "zapping_tick_failed");
-        }
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-        catch (Exception ex)
-#else
-        catch (Exception)
-#endif
-        {
-            RemoveZappingState(viewerProfile);
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=tick_exception");
-            #endif
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog($"ZAPPING_TICK failed viewerProfile={viewerProfile} source={source} exception={ex.GetType().Name} message={ex.Message}");
-            #endif
-            return new ZappingTickResult(false, "zapping_tick_exception");
-        }
-        finally
-        {
-            gate.Release();
-        }
-    }
-
-    private void ScheduleZappingAfterAttempt(string viewerProfile, long generation, string serviceKey, string viewerSessionId, long viewerGeneration, int processId)
-    {
-        var key = BuildZappingKey(viewerProfile);
-        var now = DateTimeOffset.Now;
-        lock (_zappingLock)
-        {
-            if (!_zappingStates.TryGetValue(key, out var existing) || !existing.Active || existing.Generation != generation || generation != CurrentOperationGeneration(viewerProfile)) return;
-            var updated = existing with
-            {
-                LastTickAt = now,
-                NextTickAt = now.AddSeconds(existing.IntervalSeconds),
-                LastServiceKey = serviceKey ?? string.Empty,
-                ViewerSessionId = viewerSessionId,
-                ViewerGeneration = viewerGeneration,
-                ProcessId = processId
-            };
-            _zappingStates[key] = updated;
-            ScheduleNextZappingTickLocked(key, updated);
-        }
-    }
-
-    private bool IsCurrentZappingGeneration(string viewerProfile, long generation)
-    {
-        var key = BuildZappingKey(viewerProfile);
-        lock (_zappingLock)
-        {
-            return _zappingStates.TryGetValue(key, out var state) && state.Active && state.Generation == generation && generation == CurrentOperationGeneration(viewerProfile);
-        }
-    }
-
-    private void StartPowerOff(string viewerProfile, int hours, string windowId)
-    {
-        var key = BuildZappingKey(viewerProfile);
-        var deadline = DateTimeOffset.Now.AddHours(hours);
-        var generation = Interlocked.Increment(ref _powerOffGeneration);
-        lock (_powerOffLock)
-        {
-            if (_powerOffTimers.Remove(key, out var oldTimer)) oldTimer.Dispose();
-            _powerOffStates[key] = new PowerOffState(true, deadline, viewerProfile, windowId ?? string.Empty, generation);
-            _powerOffTimers[key] = new Timer(
-                _ => _ = RunPowerOffTimerAsync(viewerProfile, windowId ?? string.Empty, deadline, generation),
-                null,
-                deadline - DateTimeOffset.Now,
-                Timeout.InfiniteTimeSpan);
-        }
-    }
-
-    private bool TryClaimPowerOffExpiry(string viewerProfile, string windowId, DateTimeOffset deadline, long generation)
-    {
-        var key = BuildZappingKey(viewerProfile);
-        lock (_powerOffLock)
-        {
-            if (!_powerOffStates.TryGetValue(key, out var state) || !state.Active ||
-                state.Generation != generation || state.Deadline != deadline ||
-                !state.WindowId.Equals(windowId ?? string.Empty, StringComparison.OrdinalIgnoreCase))
-                return false;
-
-            _powerOffStates.Remove(key);
-            if (_powerOffTimers.Remove(key, out var timer)) timer.Dispose();
-            return true;
-        }
-    }
-
-    private async Task RunPowerOffTimerAsync(string viewerProfile, string windowId, DateTimeOffset deadline, long generation)
-    {
-        if (!TryClaimPowerOffExpiry(viewerProfile, windowId, deadline, generation))
-        {
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog($"POWER_OFF_TIMER skipped viewerProfile={viewerProfile} generation={generation} reason=inactive_or_superseded");
-            #endif
-            return;
-        }
-
-        #if AIRCON_DEVELOPER_DIAGNOSTICS
-        SafeLog($"POWER_OFF_TIMER expired viewerProfile={viewerProfile} deadline={deadline:O} generation={generation}");
-        #endif
-
-        // StopWithWindowはHostの別状態照会で推測しない。実際のRefresh契約だけを
-        // liveness evidenceとして使い、EntityNotFound等が返った場合だけtimerを収束させる。
-        // これによりlive ToolWindowを誤ってdead判定せず、stale WindowIdでViewerを停止しない。
-        if (!string.IsNullOrWhiteSpace(windowId))
-        {
-            var windowRefresh = AIrConNewApiBridge.RefreshToolWindow(windowId, null);
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog($"POWER_OFF_WINDOW_REFRESH result={(windowRefresh.Success ? "OK" : "FAILED")} windowId={windowId} viewerProfile={viewerProfile} diagnostics={windowRefresh.Diagnostics}");
-            #endif
-            if (!windowRefresh.Success && IsDefinitiveWindowGone(windowRefresh.Diagnostics))
-            {
-                RemoveZappingState(viewerProfile);
-                StopPowerOffForWindow(viewerProfile, windowId);
-                #if AIRCON_DEVELOPER_DIAGNOSTICS
-                SafeLog($"POWER_OFF_TIMER cancelled viewerProfile={viewerProfile} reason=refresh_target_not_found windowId={windowId} diagnostics={windowRefresh.Diagnostics} backgroundExecution=StopWithWindow");
-                #endif
-                return;
-            }
-        }
-
-        #if AIRCON_DEVELOPER_DIAGNOSTICS
-        SafeLog($"POWER_OFF_TIMER shutdown_started viewerProfile={viewerProfile}");
-        #endif
-        HostActionDispatchResult result;
-        try
-        {
-            result = await CompleteShutdownAsync(viewerProfile, windowId, "power_off_timer").ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            result = HostActionDispatchResult.Failure("power_off_timer_exception", ex.Message);
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog($"POWER_OFF_TIMER failed viewerProfile={viewerProfile} exception={ex.GetType().Name} message={ex.Message}");
-            #endif
-        }
-        #if AIRCON_DEVELOPER_DIAGNOSTICS
-        SafeLog($"POWER_OFF_TIMER {(result.Success ? "completed" : "failed")} viewerProfile={viewerProfile} result={(result.Success ? "OK" : "FAILED")} diagnostics={result.Diagnostics} message={result.Message}");
-        #endif
-
-        // The server-side expiry path has no Safe Event response that can rerender AIrCon.
-        // CompleteShutdownAsync already clears both zapping and power-off state before stopping
-        // the Viewer, so passively refresh the existing ToolWindow after completion to replace
-        // the stale "巡回中" / timer display with the stopped state. Do not activate, reveal,
-        // restore, reposition, or scroll the window during this passive state synchronization.
-        if (!string.IsNullOrWhiteSpace(windowId))
-        {
-            var refresh = AIrConNewApiBridge.RefreshToolWindow(windowId, string.Empty);
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog($"POWER_OFF_REFRESH result={(refresh.Success ? "OK" : "FAILED")} windowId={windowId} viewerProfile={viewerProfile} diagnostics={refresh.Diagnostics}");
-            #endif
-        }
-    }
-
-    private void SetPowerOffStopped(string viewerProfile)
-    {
-        var key = BuildZappingKey(viewerProfile);
-        lock (_powerOffLock)
-        {
-            _powerOffStates.Remove(key);
-            if (_powerOffTimers.Remove(key, out var timer)) timer.Dispose();
-        }
-    }
-
-    private void StopPowerOffForWindow(string viewerProfile, string windowId)
-    {
-        if (string.IsNullOrWhiteSpace(windowId)) return;
-        var key = BuildZappingKey(viewerProfile);
-        lock (_powerOffLock)
-        {
-            if (!_powerOffStates.TryGetValue(key, out var state) || !state.Active ||
-                !state.WindowId.Equals(windowId, StringComparison.OrdinalIgnoreCase)) return;
-            _powerOffStates.Remove(key);
-            if (_powerOffTimers.Remove(key, out var timer)) timer.Dispose();
-        }
-    }
-
-    private void PruneSupersededWindowState(string currentWindowId)
-    {
-        if (string.IsNullOrWhiteSpace(currentWindowId)) return;
-
-        // ReusePolicy=PerRoute means AIrCon owns at most one live ToolWindow for this route.
-        // A different WindowId therefore represents a disposed/superseded Host session.
-        // Remove its Plugin-owned semantic/background state instead of retaining one entry per reopen.
-        string[] staleWindowIds;
-        lock (_lastWaveByWindowId)
-        lock (_lastViewerProfileByWindowId)
-        {
-            staleWindowIds = _lastWaveByWindowId.Keys
-                .Concat(_lastViewerProfileByWindowId.Keys)
-                .Where(x => !string.IsNullOrWhiteSpace(x) && !x.Equals(currentWindowId, StringComparison.OrdinalIgnoreCase))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-        }
-
-        foreach (var staleWindowId in staleWindowIds)
-        {
-            StopWindowBackgroundExecution(staleWindowId);
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog($"WINDOW_SESSION_STATE result=PRUNED staleWindowId={staleWindowId} currentWindowId={currentWindowId} reason=per_route_window_superseded");
-            #endif
-        }
-    }
-
-    private void StopWindowBackgroundExecution(string windowId)
-    {
-        if (string.IsNullOrWhiteSpace(windowId)) return;
-
-        lock (_zappingLock)
-        {
-            var keys = _zappingStates
-                .Where(x => x.Value.WindowId.Equals(windowId, StringComparison.OrdinalIgnoreCase))
-                .Select(x => x.Key)
-                .ToArray();
-            foreach (var key in keys)
-            {
-                _zappingStates.Remove(key);
-                _zappingOwnRetunes.Remove(key);
-                if (_zappingTimers.Remove(key, out var timer)) timer.Dispose();
-            }
-        }
-
-        lock (_powerOffLock)
-        {
-            var keys = _powerOffStates
-                .Where(x => x.Value.WindowId.Equals(windowId, StringComparison.OrdinalIgnoreCase))
-                .Select(x => x.Key)
-                .ToArray();
-            foreach (var key in keys)
-            {
-                _powerOffStates.Remove(key);
-                if (_powerOffTimers.Remove(key, out var timer)) timer.Dispose();
-            }
-        }
-
-        lock (_lastWaveByWindowId) _lastWaveByWindowId.Remove(windowId);
-        lock (_lastViewerProfileByWindowId) _lastViewerProfileByWindowId.Remove(windowId);
-        lock (_renderedServiceByWindowId) _renderedServiceByWindowId.Remove(windowId);
-    }
-
-    private static bool IsDefinitiveWindowGone(string diagnostics)
-    {
-        if (string.IsNullOrWhiteSpace(diagnostics)) return false;
-        return diagnostics.Equals("EntityNotFound", StringComparison.OrdinalIgnoreCase)
-            || diagnostics.Equals("window_closed", StringComparison.OrdinalIgnoreCase)
-            || diagnostics.Equals("window_closing", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private DateTimeOffset? ResolvePowerOffDeadline(string viewerProfile)
-    {
-        var key = BuildZappingKey(viewerProfile);
-        lock (_powerOffLock)
-        {
-            if (_powerOffStates.TryGetValue(key, out var state) && state.Active && state.Deadline > DateTimeOffset.Now) return state.Deadline;
-        }
-        return null;
-    }
-
-    private async Task<HostActionDispatchResult> CompleteShutdownAsync(string viewerProfile, string? windowId, string origin)
-    {
-        var generation = NextOperationGeneration(viewerProfile);
-        RemoveZappingState(viewerProfile);
-        SetPowerOffStopped(viewerProfile);
-
-        var gate = GetProfileOperationGate(viewerProfile);
-        await gate.WaitAsync().ConfigureAwait(false);
-        try
-        {
-            var result = await DispatchViewerStopForProfileAsync(viewerProfile, windowId ?? string.Empty, origin).ConfigureAwait(false);
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog($"COMPLETE_SHUTDOWN viewerProfile={viewerProfile} operationGeneration={generation} origin={origin} result={(result.Success ? "OK" : "FAILED")} message={result.Message}");
-            #endif
-            return result;
-        }
-        catch (Exception ex)
-        {
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog($"COMPLETE_SHUTDOWN failed viewerProfile={viewerProfile} operationGeneration={generation} origin={origin} exception={ex.GetType().Name} message={ex.Message}");
-            #endif
-            return HostActionDispatchResult.Failure("viewer_stop_exception", ex.Message);
-        }
-        finally
-        {
-            gate.Release();
-        }
-    }
-
-
-    private async Task<AIrConNewApiBridge.OperationResult> SwitchViewerServiceAsync(string viewerProfile, string wave, int networkId, int transportStreamId, int serviceId, string source, string viewerActivation)
-    {
-        var gate = GetProfileOperationGate(viewerProfile);
-        await gate.WaitAsync().ConfigureAwait(false);
-        try
-        {
-            return await SwitchViewerServiceCoreAsync(viewerProfile, wave, networkId, transportStreamId, serviceId, source, viewerActivation, null).ConfigureAwait(false);
-        }
-        finally
-        {
-            gate.Release();
-        }
-    }
-
-    private async Task<AIrConNewApiBridge.OperationResult> SwitchViewerServiceCoreAsync(
-        string viewerProfile,
-        string wave,
-        int networkId,
-        int transportStreamId,
-        int serviceId,
-        string source,
-        string viewerActivation,
-        Func<bool>? continuationGuard)
-    {
-        if (continuationGuard != null && !continuationGuard())
-            return AIrConNewApiBridge.OperationResult.Fail("superseded_before_tune", "Viewer switch was superseded before tuning.");
-
-        var before = FindActiveViewerSession(viewerProfile);
-        var manualAction = source.Equals("manual_dblclick", StringComparison.Ordinal);
-        var existingSession = before != null && !string.IsNullOrWhiteSpace(before.ViewerSessionId) &&
-            before.ProcessId.GetValueOrDefault() > 0 && before.Generation > 0;
-        var manualServiceKey = ServiceKey(networkId, transportStreamId, serviceId);
-        if (manualAction)
-        {
-            // Register before the Host call: its event may be dispatched synchronously.
-            // A newly started session has no ID until TuneAsync completes; only the
-            // initial generation (1) with this exact target triplet can acknowledge it.
-            lock (_zappingLock)
-                _manualOwnRetunes[BuildZappingKey(viewerProfile)] = existingSession
-                    ? (before!.ViewerSessionId, before.Generation + 1, manualServiceKey)
-                    : (string.Empty, 1L, manualServiceKey);
-        }
-        var start = await AIrConNewApiBridge.TuneAsync(
-            viewerProfile,
-            wave,
-            networkId,
-            transportStreamId,
-            serviceId,
-            viewerActivation: viewerActivation).ConfigureAwait(false);
-        if (!start.Success)
-        {
-            if (manualAction)
-                lock (_zappingLock) _manualOwnRetunes.Remove(BuildZappingKey(viewerProfile));
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog($"VIEWER_SWITCH source={source} phase=tune profileId={viewerProfile} result=FAILED diagnostics={start.Diagnostics}");
-            #endif
-            return start;
-        }
-
-        if (continuationGuard != null && !continuationGuard())
-        {
-            if (manualAction)
-                lock (_zappingLock) _manualOwnRetunes.Remove(BuildZappingKey(viewerProfile));
-            return AIrConNewApiBridge.OperationResult.Fail("superseded_after_tune", "Viewer switch was superseded after tuning.");
-        }
-
-        if (start.NetworkId != networkId || start.TransportStreamId != transportStreamId || start.ServiceId != serviceId)
-        {
-            if (manualAction)
-                lock (_zappingLock) _manualOwnRetunes.Remove(BuildZappingKey(viewerProfile));
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog($"VIEWER_SWITCH source={source} phase=operation_result profileId={viewerProfile} wave={wave} nid={networkId} tsid={transportStreamId} sid={serviceId} result=FAILED diagnostics=viewer_operation_identity_mismatch");
-            #endif
-            return AIrConNewApiBridge.OperationResult.Fail("viewer_operation_identity_mismatch", "Viewer operation returned a different service identity.");
-        }
-
-        // Unexpected session identity or generation must follow the normal event refresh.
-        // For a new launch, generation 1 is the only own acknowledgment we can accept.
-        if (manualAction && (existingSession
-            ? (!string.Equals(start.ViewerSessionId, before!.ViewerSessionId, StringComparison.Ordinal) ||
-               start.Generation != before.Generation + 1)
-            : (string.IsNullOrWhiteSpace(start.ViewerSessionId) || start.Generation != 1)))
-            lock (_zappingLock) _manualOwnRetunes.Remove(BuildZappingKey(viewerProfile));
-
-        // Once the Host has returned the new session, replace the short-lived
-        // generation-1 launch wildcard with its exact session ID, if not yet consumed.
-        if (manualAction && !existingSession && !string.IsNullOrWhiteSpace(start.ViewerSessionId))
-        {
-            lock (_zappingLock)
-            {
-                var key = BuildZappingKey(viewerProfile);
-                if (_manualOwnRetunes.TryGetValue(key, out var pending) &&
-                    pending.SessionId.Length == 0 && pending.Generation == 1 &&
-                    pending.ServiceKey.Equals(manualServiceKey, StringComparison.OrdinalIgnoreCase))
-                    _manualOwnRetunes[key] = (start.ViewerSessionId, 1, manualServiceKey);
-            }
-        }
-
-        AIrConNewApiBridge.InvalidateViewerProjection();
-        #if AIRCON_DEVELOPER_DIAGNOSTICS
-        SafeLog($"VIEWER_SWITCH source={source} profileId={viewerProfile} oldSession={before?.ViewerSessionId ?? "-"} oldPid={before?.ProcessId?.ToString() ?? "-"} newSession={start.ViewerSessionId} newPid={start.ProcessId?.ToString() ?? "-"} generation={start.Generation} wave={wave} nid={networkId} tsid={transportStreamId} sid={serviceId} result=OK route=runtime_viewer_operation_result projection=viewer_invalidated");
-        #endif
-        return start;
-    }
-
-    private async Task<HostActionDispatchResult> DispatchViewerStopForProfileAsync(string viewerProfile, string windowId, string origin)
-    {
-        var result = await AIrConNewApiBridge.StopAsync(viewerProfile).ConfigureAwait(false);
-        if (result.Success) AIrConNewApiBridge.InvalidateViewerProjection();
-        #if AIRCON_DEVELOPER_DIAGNOSTICS
-        SafeLog($"VIEWER_OPERATION action=Stop profileId={viewerProfile} origin=AIrCon reason={origin} result={(result.Success ? "OK" : "FAILED")} diagnostics={result.Diagnostics}");
-        #endif
-        return result.Success ? HostActionDispatchResult.Ok(result.Diagnostics) : HostActionDispatchResult.Failure(result.Diagnostics, result.Message);
-    }
-
-    private static void AppendViewerSessionContractFields(Dictionary<string, string?> fields, ViewerSessionContractState? sessionContract)
-    {
-        if (sessionContract == null || string.IsNullOrWhiteSpace(sessionContract.ViewerSessionId) || sessionContract.Generation <= 0) return;
-        fields["viewerSessionId"] = sessionContract.ViewerSessionId;
-        fields["expectedGeneration"] = sessionContract.Generation.ToString(System.Globalization.CultureInfo.InvariantCulture);
-    }
-
-    private ViewerSessionRow? FindActiveViewerSession(string viewerProfile)
-    {
-        try
-        {
-            return CaptureViewerSessionsNewApi()
-                .Where(x => x.ViewerProfile.Equals(viewerProfile, StringComparison.OrdinalIgnoreCase))
-                .Where(x => x.IsActive && !string.IsNullOrWhiteSpace(x.ViewerSessionId))
-                .OrderByDescending(x => x.Current)
-                .FirstOrDefault();
-        }
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-        catch (Exception ex)
-#else
-        catch (Exception)
-#endif
-        {
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog($"VIEWER_SESSION_LOOKUP failed viewerProfile={viewerProfile} exception={ex.GetType().Name} message={ex.Message}");
-            #endif
-            return null;
-        }
-    }
-
-    private SemaphoreSlim GetProfileOperationGate(string viewerProfile)
-    {
-        var key = BuildZappingKey(viewerProfile);
-        lock (_operationLock)
-        {
-            if (!_profileOperationGates.TryGetValue(key, out var gate))
-            {
-                gate = new SemaphoreSlim(1, 1);
-                _profileOperationGates[key] = gate;
-            }
-            return gate;
-        }
-    }
-
-    private long NextOperationGeneration(string viewerProfile)
-    {
-        var key = BuildZappingKey(viewerProfile);
-        lock (_operationLock)
-        {
-            var next = _operationGenerations.TryGetValue(key, out var current) ? checked(current + 1) : 1L;
-            _operationGenerations[key] = next;
-            return next;
-        }
-    }
-
-    private long CurrentOperationGeneration(string viewerProfile)
-    {
-        var key = BuildZappingKey(viewerProfile);
-        lock (_operationLock)
-        {
-            return _operationGenerations.TryGetValue(key, out var current) ? current : 0L;
-        }
-    }
-
-    private static string BuildZappingKey(string viewerProfile)
-    {
-        return NormalizeViewerProfileId(viewerProfile);
-    }
-
-    internal void ApplyViewerOperationPreempting(TvAirViewerOperationPreempting operation)
-    {
-        if (operation == null || string.IsNullOrWhiteSpace(operation.ViewerProfileId) || string.IsNullOrWhiteSpace(operation.ViewerReservationId)) return;
-        ClearAutomaticViewerState(operation.ViewerProfileId);
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-        SafeLog($"VIEWER_OPERATION_PREEMPT viewerProfile={operation.ViewerProfileId} sourceKind={operation.SourceKind} reservation={operation.ViewerReservationId} action=clear_automatic_viewer_state");
-#endif
-    }
-
-    private void ClearAutomaticViewerState(string viewerProfile)
-    {
-        // One profile-scoped boundary for every Host-owned explicit Viewer Operation.
-        // Reservation code does not know individual automation features.
-        NextOperationGeneration(viewerProfile);
-        RemoveZappingState(viewerProfile);
-        SetPowerOffStopped(viewerProfile);
-    }
-
-    internal void ApplyViewerReservationChanged(TvAIrPlugin.Events.PluginEventEnvelope eventEnvelope)
-    {
-        var reservation = TryReadViewerReservation(eventEnvelope.Payload);
-        if (reservation == null || string.IsNullOrWhiteSpace(reservation.ViewerProfileId)) return;
-
-        var completed = eventEnvelope.ChangeKind?.Equals("Completed", StringComparison.OrdinalIgnoreCase) == true
-            || reservation.State.Equals("Completed", StringComparison.OrdinalIgnoreCase);
-        if (!completed) return;
-
-        var wave = ResolveServiceWave(new TvAirServiceIdentityDto
-        {
-            NetworkId = (ushort)reservation.NetworkId,
-            TransportStreamId = (ushort)reservation.TransportStreamId,
-            ServiceId = (ushort)reservation.ServiceId
-        });
-        if (string.IsNullOrWhiteSpace(wave)) return;
-
-        string[] windows;
-        lock (_lastViewerProfileByWindowId) windows = _lastViewerProfileByWindowId.Keys.ToArray();
-        foreach (var windowId in windows)
-        {
-            lock (_lastViewerProfileByWindowId) _lastViewerProfileByWindowId[windowId] = reservation.ViewerProfileId;
-            lock (_lastWaveByWindowId) _lastWaveByWindowId[windowId] = wave;
-            var route = BuildViewerContentRoute(wave, reservation.ViewerProfileId);
-            var refresh = AIrConNewApiBridge.RefreshToolWindow(windowId, route);
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog($"VIEWER_RESERVATION_DISPLAY result={(refresh.Success ? "OK" : "FAILED")} reservation={reservation.ReservationId} viewerProfile={reservation.ViewerProfileId} wave={wave} windowId={windowId} diagnostics={refresh.Diagnostics}");
-#endif
-        }
-    }
-
-    private static TvAirViewerReservationDto? TryReadViewerReservation(object? payload)
-    {
-        if (payload is TvAirEventDto eventDto) return eventDto.ViewerReservation;
-        if (payload is TvAirViewerReservationDto reservation) return reservation;
-        if (payload is TvAirViewerReservation runtimeReservation)
-        {
-            return new TvAirViewerReservationDto
-            {
-                ReservationId = runtimeReservation.ReservationId,
-                ViewerProfileId = runtimeReservation.ViewerProfileId,
-                NetworkId = runtimeReservation.Service.NetworkId,
-                TransportStreamId = runtimeReservation.Service.TransportStreamId,
-                ServiceId = runtimeReservation.Service.ServiceId,
-                EventId = runtimeReservation.EventId,
-                ScheduledStart = runtimeReservation.ScheduledStart,
-                ScheduledEnd = runtimeReservation.ScheduledEnd,
-                State = runtimeReservation.State,
-                FailureReason = runtimeReservation.FailureReason,
-                CreatedAt = runtimeReservation.CreatedAt,
-                UpdatedAt = runtimeReservation.UpdatedAt
-            };
-        }
-        if (payload is JsonElement json)
-        {
-            try
-            {
-                if (json.ValueKind == JsonValueKind.Object &&
-                    (json.TryGetProperty("viewerReservation", out var nested) || json.TryGetProperty("ViewerReservation", out nested)))
-                    return nested.Deserialize<TvAirViewerReservationDto>();
-                return json.Deserialize<TvAirViewerReservationDto>();
-            }
-            catch (JsonException) { return null; }
-        }
-        return null;
-    }
-
-    internal void ApplyViewerSessionStatePatch(TvAIrPlugin.Events.PluginEventEnvelope eventEnvelope)
-    {
-        if (eventEnvelope.Sequence <= 0)
-        {
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog($"VIEWER_SESSION_STATEPATCH result=SKIPPED reason=invalid_revision revision={eventEnvelope.Sequence}");
-            #endif
-            return;
-        }
-
-        var viewerSessionId = ResolveViewerSessionId(eventEnvelope.EntityId);
-        if (string.IsNullOrWhiteSpace(viewerSessionId))
-        {
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog($"VIEWER_SESSION_STATEPATCH result=SKIPPED reason=event_session_missing entityId={eventEnvelope.EntityId ?? "-"} revision={eventEnvelope.Sequence}");
-            #endif
-            return;
-        }
-
-        var eventSession = AIrConNewApiBridge.GetSession(viewerSessionId);
-        if (eventSession == null || string.IsNullOrWhiteSpace(eventSession.ViewerProfileId))
-        {
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog($"VIEWER_SESSION_STATEPATCH result=SKIPPED reason=event_session_unresolved viewerSession={viewerSessionId} revision={eventEnvelope.Sequence}");
-            #endif
-            return;
-        }
-
-        var viewerProfile = eventSession.ViewerProfileId.Trim();
-        var active = eventSession.ProcessId is > 0
-            && !eventSession.State.Equals("stopped", StringComparison.OrdinalIgnoreCase)
-            && !eventSession.State.Equals("closed", StringComparison.OrdinalIgnoreCase);
-        if (active)
-        {
-            // ViewerSessionChanged also reports Host-owned retunes of an existing TVTest.
-            // The prior terminal-only branch discarded those events and kept the old row
-            // highlighted even though CurrentService had advanced on the Host.
-            var service = eventSession.CurrentService;
-            if (service is not { NetworkId: > 0, TransportStreamId: > 0, ServiceId: > 0 }) return;
-            var currentKey = ServiceKey(service.NetworkId, service.TransportStreamId, service.ServiceId);
-            var currentWave = ResolveServiceWave(service);
-            // A manual double-click's successful action response owns its content refresh.
-            // Consume only the exact expected Host acknowledgment once. External retunes,
-            // newer generations and unrelated services must retain normal presentation updates.
-            lock (_zappingLock)
-            {
-                var ownKey = BuildZappingKey(viewerProfile);
-                if (_manualOwnRetunes.TryGetValue(ownKey, out var ownManual) &&
-                    (ownManual.SessionId.Equals(viewerSessionId, StringComparison.Ordinal) ||
-                     (ownManual.SessionId.Length == 0 && eventSession.Generation == 1)) &&
-                    ownManual.Generation == eventSession.Generation &&
-                    ownManual.ServiceKey.Equals(currentKey, StringComparison.OrdinalIgnoreCase))
-                {
-                    _manualOwnRetunes.Remove(ownKey);
-                    #if AIRCON_DEVELOPER_DIAGNOSTICS
-                    SafeLog($"VIEWER_SESSION_STATEPATCH result=SKIPPED reason=manual_action_owns_refresh viewerProfile={viewerProfile} service={currentKey} generation={eventSession.Generation} revision={eventEnvelope.Sequence}");
-                    #endif
-                    return;
-                }
-            }
-            // The zapping tick independently refreshes its visible wave after success.
-            // Skip only a matching acknowledgment, not other Host/ProgramGuide retunes.
-            lock (_zappingLock)
-            {
-                var zappingKey = BuildZappingKey(viewerProfile);
-                if (_zappingOwnRetunes.TryGetValue(zappingKey, out var own) &&
-                    own.SessionId.Equals(viewerSessionId, StringComparison.Ordinal) &&
-                    own.Generation == eventSession.Generation &&
-                    own.ServiceKey.Equals(currentKey, StringComparison.OrdinalIgnoreCase) &&
-                    _zappingStates.TryGetValue(zappingKey, out var running) && running.Active)
-                {
-                    #if AIRCON_DEVELOPER_DIAGNOSTICS
-                    SafeLog($"VIEWER_SESSION_STATEPATCH result=SKIPPED reason=zapping_tick_owns_refresh viewerProfile={viewerProfile} service={currentKey} generation={eventSession.Generation} revision={eventEnvelope.Sequence}");
-                    #endif
-                    return;
-                }
-            }
-            KeyValuePair<string, string>[] windows;
-            lock (_lastViewerProfileByWindowId)
-                windows = _lastViewerProfileByWindowId
-                    .Where(x => x.Value.Equals(viewerProfile, StringComparison.OrdinalIgnoreCase))
-                    .ToArray();
-            foreach (var pair in windows)
-            {
-                var windowId = pair.Key;
-                if (string.IsNullOrWhiteSpace(windowId)) continue;
-                string renderedKey;
-                lock (_renderedServiceByWindowId)
-                    if (!_renderedServiceByWindowId.TryGetValue(windowId, out renderedKey!)) continue;
-                if (renderedKey.Equals(currentKey, StringComparison.OrdinalIgnoreCase)) continue;
-
-                // Preserve a manually browsed wave. Follow cross-wave retunes only
-                // when this window had been displaying the *previous* tuned service.
-                string displayedWave;
-                lock (_lastWaveByWindowId)
-                    if (!_lastWaveByWindowId.TryGetValue(windowId, out displayedWave!)) continue;
-                var displayedFilter = NormalizeWaveFilter(displayedWave);
-                string? refreshRoute = null;
-                if (!displayedFilter.Equals(currentWave, StringComparison.OrdinalIgnoreCase))
-                {
-                    var priorService = AIrConNewApiBridge.ListServices().FirstOrDefault(row =>
-                        ServiceKey(row.NetworkId, row.TransportStreamId, row.ServiceId)
-                            .Equals(renderedKey, StringComparison.OrdinalIgnoreCase));
-                    if (priorService == null ||
-                        !NormalizeWaveFilter(priorService.BroadcastType).Equals(displayedFilter, StringComparison.OrdinalIgnoreCase))
-                    {
-                        #if AIRCON_DEVELOPER_DIAGNOSTICS
-                        SafeLog($"VIEWER_SESSION_STATEPATCH result=SKIPPED reason=browsing_other_wave windowId={windowId} viewerProfile={viewerProfile} displayedWave={displayedWave} currentWave={currentWave} revision={eventEnvelope.Sequence}");
-                        #endif
-                        continue;
-                    }
-                    refreshRoute = BuildViewerContentRoute(currentWave, viewerProfile);
-                }
-
-                // Host owns the channel; refresh is presentation-only and never issues
-                // a new ViewerOperation, retune, activation, or window foreground request.
-                var refreshed = AIrConNewApiBridge.RefreshToolWindow(windowId, refreshRoute);
-                #if AIRCON_DEVELOPER_DIAGNOSTICS
-                SafeLog($"VIEWER_SESSION_STATEPATCH result={(refreshed.Success ? "REFRESHED" : "FAILED")} reason=active_service_changed windowId={windowId} viewerProfile={viewerProfile} service={currentKey} revision={eventEnvelope.Sequence} diagnostics={refreshed.Diagnostics}");
-                #endif
-                if (!refreshed.Success && IsDefinitiveWindowGone(refreshed.Diagnostics))
-                    StopWindowBackgroundExecution(windowId);
-            }
-            return;
-        }
-
-        // Runtime Viewer Session is the single lifecycle authority for AIrCon-managed TVTest.
-        // Whether the process ended through AIrCon power-off, TVTest's X button, or an external
-        // process termination, the same terminal transition clears Plugin-owned background state.
-        RemoveZappingState(viewerProfile);
-        SetPowerOffStopped(viewerProfile);
-
-        KeyValuePair<string, string>[] targetWindows;
-        lock (_lastViewerProfileByWindowId)
-            targetWindows = _lastViewerProfileByWindowId
-                .Where(x => x.Value.Equals(viewerProfile, StringComparison.OrdinalIgnoreCase))
-                .ToArray();
-
-        if (targetWindows.Length == 0)
-        {
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog($"VIEWER_SESSION_STATEPATCH result=SKIPPED reason=event_profile_not_displayed viewerSession={viewerSessionId} viewerProfile={viewerProfile} active=False backgroundStateCleared=True revision={eventEnvelope.Sequence}");
-            #endif
-            return;
-        }
-
-        var terminalWave = ResolveServiceWave(eventSession.CurrentService);
-
-        // ViewerSessionChanged is authoritative for the affected session. Patch only ToolWindows
-        // currently displaying that exact Viewer Profile; never substitute a default GR/BSCS
-        // profile and never sweep unrelated windows.
-        foreach (var pair in targetWindows)
-        {
-            var windowId = pair.Key;
-            if (string.IsNullOrWhiteSpace(windowId)) continue;
-
-            var patches = new List<RuntimeUiPatch>
-            {
-                RuntimeUiPatch.Enabled("aircon-viewer-power-button", false),
-                RuntimeUiPatch.Classes(
-                    "aircon-viewer-power-button",
-                    add: new[] { "aircon-toolbar-button-disabled" },
-                    remove: Array.Empty<string>()),
-                new RuntimeUiPatch
-                {
-                    ElementId = "aircon-viewer-power-button",
-                    Attributes = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
-                    {
-                        ["aria-disabled"] = "true",
-                        ["title"] = "選択中のTVTestは停止済みです"
-                    }
-                },
-                RuntimeUiPatch.Text("aircon-zapping-status", "停止中"),
-                RuntimeUiPatch.Classes("aircon-zapping-status",
-                    add: new[] { "aircon-zapping-status-off" },
-                    remove: new[] { "aircon-zapping-status-on" }),
-                RuntimeUiPatch.Text("aircon-zapping-button", "開始"),
-                RuntimeUiPatch.Classes("aircon-zapping-button",
-                    add: Array.Empty<string>(),
-                    remove: new[] { "aircon-zapping-button-on" }),
-                RuntimeUiPatch.Text("aircon-sleep-label", "電源OFF"),
-                RuntimeUiPatch.Visibility("aircon-sleep-select", visible: true),
-                RuntimeUiPatch.Visibility("aircon-sleep-remaining", visible: false),
-                RuntimeUiPatch.Text("aircon-sleep-button", "開始"),
-                RuntimeUiPatch.Classes("aircon-sleep-button",
-                    add: Array.Empty<string>(),
-                    remove: new[] { "aircon-sleep-button-on" })
-            };
-
-            var displayedWave = string.Empty;
-            lock (_lastWaveByWindowId)
-            {
-                if (_lastWaveByWindowId.TryGetValue(windowId, out var rememberedWave))
-                    displayedWave = rememberedWave;
-            }
-
-            // The viewing row exists only when this window is displaying the terminal session's
-            // exact service wave. Remove its semantic viewing/zapping class in the same lifecycle
-            // transaction that disables the power button; no separate visual-state authority.
-            if (!string.IsNullOrWhiteSpace(terminalWave)
-                && NormalizeWaveFilter(displayedWave).Equals(terminalWave, StringComparison.OrdinalIgnoreCase))
-            {
-                patches.Add(RuntimeUiPatch.Classes(CurrentViewingAnchorId,
-                    add: Array.Empty<string>(),
-                    remove: new[] { "aircon-row-viewing-selected", "aircon-row-viewing-other", "aircon-row-zapping-selected" }));
-            }
-
-            var result = AIrConNewApiBridge.PatchToolWindow(windowId, patches, eventEnvelope.Sequence);
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog($"VIEWER_SESSION_STATEPATCH result={(result.Success ? "OK" : "FAILED")} windowId={windowId} viewerSession={viewerSessionId} viewerProfile={viewerProfile} active=False lifecycleAuthority=runtime_viewer_session terminalWave={terminalWave} displayedWave={displayedWave} backgroundStateCleared=True revision={eventEnvelope.Sequence} diagnostics={result.Diagnostics}");
-            #endif
-            if (result.Success && result.Diagnostics.Contains("reason=window_closed", StringComparison.OrdinalIgnoreCase))
-                StopWindowBackgroundExecution(windowId);
-        }
-    }
-
-    private static string ResolveServiceWave(TvAIrPlugin.Viewers.TvAirServiceIdentityDto? service)
-    {
-        if (service == null) return string.Empty;
-        try
-        {
-            var row = AIrConNewApiBridge.ListServices().FirstOrDefault(x =>
-                x.NetworkId == service.NetworkId
-                && x.TransportStreamId == service.TransportStreamId
-                && x.ServiceId == service.ServiceId);
-            return row == null ? string.Empty : NormalizeWaveFilter(row.BroadcastType);
-        }
-        catch
-        {
-            return string.Empty;
-        }
-    }
-
-    private static string ResolveViewerSessionId(string? entityId)
-    {
-        const string prefix = "viewer-session:";
-        var value = (entityId ?? string.Empty).Trim();
-        return value.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
-            ? value[prefix.Length..].Trim()
-            : string.Empty;
-    }
-
-    private string ResolveRequestedViewerProfile(IReadOnlyDictionary<string, string> query, string windowId)
-    {
-        var requested = FirstNonEmpty(
-            QueryString(query, "viewerProfile"),
-            QueryString(query, "viewer-profile"),
-            QueryString(query, "viewer_profile"),
-            QueryString(query, "viewerProfileId"),
-            QueryString(query, "viewer-profile-id"));
-
-        var vtuner = QueryString(query, "vtuner");
-        if (string.IsNullOrWhiteSpace(requested) && IsViewerProfileLike(vtuner)) requested = vtuner;
-
-        if (!string.IsNullOrWhiteSpace(requested)) return requested;
-        if (!string.IsNullOrWhiteSpace(windowId))
-        {
-            lock (_lastViewerProfileByWindowId)
-            {
-                if (_lastViewerProfileByWindowId.TryGetValue(windowId, out var remembered) && !string.IsNullOrWhiteSpace(remembered)) return remembered;
-            }
-        }
-        return string.Empty;
-    }
-
-    private void RememberViewerProfile(string windowId, string viewerProfile, bool isToolWindow)
-    {
-        if (!isToolWindow || string.IsNullOrWhiteSpace(windowId) || string.IsNullOrWhiteSpace(viewerProfile)) return;
-        if (IsAutoProfileId(viewerProfile)) return;
-        lock (_lastViewerProfileByWindowId)
-        {
-            _lastViewerProfileByWindowId[windowId] = viewerProfile.Trim();
-        }
-    }
-
-    private static bool IsViewerProfileLike(string value)
-    {
-        if (string.IsNullOrWhiteSpace(value)) return false;
-        var v = value.Trim();
-        return v.StartsWith("tvtest", StringComparison.OrdinalIgnoreCase)
-            || v.StartsWith("viewer", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static string NormalizeViewerProfileId(string value)
-    {
-        var text = (value ?? string.Empty).Trim();
-        if (string.IsNullOrWhiteSpace(text)) return string.Empty;
-        if (IsAutoProfileId(text)) return string.Empty;
-        return text;
-    }
-
-    private static string BuildRenderFailureHtml(RuntimeUiRenderContext context)
-    {
-        return "<!doctype html><html><head><meta charset=\"utf-8\"><style>" +
-            ResolveThemePalette(context).Apply(
-                "html,body{margin:0;background:var(--aircon-page);color:var(--aircon-text);font-family:Meiryo,Arial,sans-serif;font-size:12px}.aircon-error{padding:12px}") +
-            "</style></head><body><div class=\"aircon-error\">AIrCon表示を生成できませんでした。</div></body></html>";
-    }
-
-
-    private ViewerProfileState CaptureViewerProfiles(RuntimeUiRenderContext context)
-    {
-        try
-        {
-            // Runtime Viewers API is the authoritative generic source for configured viewing slots.
-            // Do not infer profiles from active sessions or UI request state.
-            var runtimeProfiles = AIrConNewApiBridge.ListProfiles();
-            if (runtimeProfiles.Count > 0)
-            {
-                var runtimeSelectable = runtimeProfiles
-                    .Where(x => x.IsAvailable && !string.IsNullOrWhiteSpace(x.ViewerProfileId))
-                    .Select((x, index) => new ViewerProfileChoice(
-                        x.ViewerProfileId.Trim(),
-                        FirstNonEmpty(x.DisplayName, x.ViewerProfileId),
-                        true,
-                        x.IsDefault,
-                        index,
-                        x.BroadcastGroups?.Where(g => !string.IsNullOrWhiteSpace(g)).Select(g => g.Trim()).ToArray() ?? Array.Empty<string>(),
-                        x.TvTestFrameIndex,
-                        x.LogicalViewerSlotId ?? string.Empty,
-                        false))
-                    .Where(x => !IsAutoProfileId(x.Id))
-                    .GroupBy(x => x.Id, StringComparer.OrdinalIgnoreCase)
-                    .Select(g => g.First())
-                    .ToList();
-
-                var runtimeDefaultId = FirstNonEmpty(
-                    runtimeSelectable.FirstOrDefault(x => x.IsDefault)?.Id,
-                    runtimeSelectable.FirstOrDefault()?.Id);
-                var runtimeVisible = runtimeSelectable.Count >= 2;
-                #if AIRCON_DEVELOPER_DIAGNOSTICS
-                SafeLog("VIEWER_PROFILE_SELECTOR source=runtime_viewers_api profiles=" + runtimeSelectable.Count + " visible=" + runtimeVisible + " default=" + runtimeDefaultId + " profileIds=" + string.Join(",", runtimeSelectable.Select(x => x.Id)));
-                #endif
-                return new ViewerProfileState(runtimeSelectable, runtimeDefaultId, runtimeVisible, true, true);
-            }
-
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog("VIEWER_PROFILE_SELECTOR source=runtime_viewers_api profiles=0 visible=False fallback=none");
-            #endif
-            return ViewerProfileState.Unavailable;
-        }
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-        catch (Exception ex)
-#else
-        catch (Exception)
-#endif
-        {
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog("VIEWER_PROFILE_SELECTOR exception=" + ex.GetType().Name + " " + ex.Message);
-            #endif
-            return ViewerProfileState.Unavailable;
-        }
-    }
-
-    private static IReadOnlyList<string> ReadStringList(object? obj, params string[] names)
-    {
-        foreach (var name in names)
-        {
-            var value = ReadProperty(obj, name);
-            var list = ConvertToStringList(value);
-            if (list.Count > 0) return list;
-        }
-        return Array.Empty<string>();
-    }
-
-    private static IReadOnlyList<string> ConvertToStringList(object? value)
-    {
-        var result = new List<string>();
-        if (value == null) return result;
-        if (value is string text)
-        {
-            foreach (var part in text.Split(new[] { ',', ';', '|', ' ' }, StringSplitOptions.RemoveEmptyEntries))
-            {
-                var normalized = NormalizeAvailableGroup(part);
-                if (!string.IsNullOrWhiteSpace(normalized) && !result.Contains(normalized, StringComparer.OrdinalIgnoreCase)) result.Add(normalized);
-            }
-            return result;
-        }
-        if (value is System.Collections.IEnumerable enumerable)
-        {
-            foreach (var item in enumerable)
-            {
-                var normalized = NormalizeAvailableGroup(item?.ToString() ?? string.Empty);
-                if (!string.IsNullOrWhiteSpace(normalized) && !result.Contains(normalized, StringComparer.OrdinalIgnoreCase)) result.Add(normalized);
-            }
-        }
-        return result;
-    }
-
-    private static string NormalizeAvailableGroup(string value)
-    {
-        var text = (value ?? string.Empty).Trim().ToUpperInvariant();
-        if (text == "地上波" || text == "TERRESTRIAL" || text == "GROUND") return "GR";
-        if (text == "BS" || text == "CS" || text == "BS/CS" || text == "BSCS" || text == "BS-CS") return "BSCS";
-        if (text == "GR") return "GR";
-        if (text is "CATV" or "ISDB-C" or "CABLE") return "CATV";
-        return text;
-    }
-
-    private static string RequiredProfileGroupForWave(string wave)
-    {
-        var normalized = NormalizeWaveFilter(wave);
-        return normalized.Equals("GR", StringComparison.OrdinalIgnoreCase) ? "GR" : normalized.Equals("CATV", StringComparison.OrdinalIgnoreCase) ? "CATV" : "BSCS";
-    }
-
-    private static bool IsAutoProfileId(string id)
-        => string.IsNullOrWhiteSpace(id)
-           || id.Equals("auto", StringComparison.OrdinalIgnoreCase)
-           || id.Equals("default", StringComparison.OrdinalIgnoreCase);
-
-    private static ViewerProfileChoice ResolveSelectedViewerProfile(string requested, ViewerProfileState state, string wave)
-    {
-        var selectable = state.SelectableProfiles.Where(x => x.Enabled).ToList();
-        var available = state.AvailableForWave(wave).ToList();
-        var desired = FirstNonEmpty(requested, state.DefaultViewerProfile, available.FirstOrDefault()?.Id, selectable.FirstOrDefault()?.Id);
-        if (IsAutoProfileId(desired)) desired = FirstNonEmpty(state.DefaultViewerProfile, available.FirstOrDefault()?.Id, selectable.FirstOrDefault()?.Id);
-
-        // The displayed wave owns the selectable Viewer Profile set.
-        // Keep the requested stable ProfileId only when it belongs to the displayed wave;
-        // otherwise select the first host-projected profile available for that wave.
-        var exact = available.FirstOrDefault(x => x.Id.Equals(desired, StringComparison.OrdinalIgnoreCase));
-        if (exact != null) return exact;
-
-        return available.FirstOrDefault() ?? ViewerProfileChoice.Unavailable;
-    }
-
-    private static ServiceRow FromRuntimeService(TvAirServiceDto service, int index)
-    {
-        var filter = NormalizeRuntimeBroadcastType(service.BroadcastType);
-        return new ServiceRow
-        {
-            ProgramGuideOrder = service.DisplayOrder != 0 ? service.DisplayOrder : index,
-            ProgramGuideFilterGroup = filter,
-            ProgramGuideFilterLabel = FilterLabel(filter),
-            AllocationGroup = filter == "GR" ? "GR" : filter == "CATV" ? "CATV" : "BSCS",
-            TunerGroup = filter == "GR" ? "GR" : filter == "CATV" ? "CATV" : "BSCS",
-            ServiceName = service.ServiceName,
-            NetworkId = service.NetworkId,
-            TransportStreamId = service.TransportStreamId,
-            ServiceId = service.ServiceId
-        };
-    }
-
-    private static string NormalizeRuntimeBroadcastType(string? value)
-    {
-        var text = (value ?? string.Empty).Trim().ToUpperInvariant();
-        if (text is "GR" or "TERRESTRIAL" or "地上波" or "地デジ") return "GR";
-        if (text is "CATV" or "ISDB-C" or "CABLE") return "CATV";
-        if (text.StartsWith("CS", StringComparison.Ordinal)) return "CS";
-        if (text is "BS" or "BSCS" or "SATELLITE" or "BS/CS") return "BS";
-        return text;
-    }
-
-    private List<ServiceRow> CaptureServiceProjection(string filter)
-    {
-        var services = AIrConNewApiBridge.ListServices()
-            .Where(x => x.IsEnabled)
-            .OrderBy(x => x.DisplayOrder)
-            .ThenBy(x => x.ServiceName, StringComparer.OrdinalIgnoreCase)
-            .Select((x, index) => FromRuntimeService(x, index))
-            .ToList();
-        services = NormalizeViewerServiceAuthority(services);
-        return services
-            .Where(x => x.ProgramGuideFilterGroup.Equals(filter, StringComparison.OrdinalIgnoreCase))
-            .OrderBy(x => x.ProgramGuideOrder)
-            .ToList();
-    }
-
-    private FloatingViewerData CaptureData(string filter, ViewerProfileState viewerProfiles, FocusTriplet focusTriplet)
-    {
-        var services = new List<ServiceRow>();
-        var sessions = new List<ViewerSessionRow>();
-        var tuners = new List<ViewerTunerRow>();
-        var waveFilters = new List<WaveFilterRow>();
-        var programEvents = new List<TvAirProgramEventDto>();
-        var viewerReservations = new List<TvAirViewerReservation>();
-        var projectionUsed = false;
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-        var channelSnapshotReceived = false;
-#endif
-        var safeEventContractAvailable = false;
-        var safeDblclickEvents = false;
-
-        // Runtime UIのクリック可能な局一覧はRuntime Channels APIを唯一の正本とし、
-        // ProgramGuide APIはNow/Next表示のoverlayにだけ使用する。
-        try
-        {
-            services = AIrConNewApiBridge.ListServices()
-                .Where(x => x.IsEnabled)
-                .OrderBy(x => x.DisplayOrder)
-                .ThenBy(x => x.ServiceName, StringComparer.OrdinalIgnoreCase)
-                .Select((x, index) => FromRuntimeService(x, index))
-                .ToList();
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-            channelSnapshotReceived = true;
-            SafeLog("viewerControlChannels=Runtime count=" + services.Count + " source=runtime_channels");
-#endif
-
-            waveFilters = AIrConNewApiBridge.ListWaveFilters()
-                .Where(x => x.IsProgramGuideFilter)
-                .OrderBy(x => x.Order)
-                .Select(x => new WaveFilterRow(FirstNonEmpty(x.Key, x.BroadcastType), FirstNonEmpty(x.BroadcastType, x.Key), FirstNonEmpty(x.Label, x.BroadcastType, x.Key)))
-                .Where(x => !string.IsNullOrWhiteSpace(x.Group))
-                .ToList();
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog("waveFilters=Runtime count=" + waveFilters.Count);
-#endif
-
-            var now = DateTimeOffset.Now;
-            programEvents = AIrConNewApiBridge.ListProgramEvents(now, now.AddHours(6)).ToList();
-            ApplyRuntimeNowNext(services, programEvents, now);
-            projectionUsed = true;
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog("programGuide=Runtime events=" + programEvents.Count + " listAuthority=runtime_channels");
-#endif
-        }
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-        catch (Exception ex) { SafeLog("runtimeProjection exception=" + ex.Message); }
-#else
-        catch (Exception) { }
-#endif
-
-        try
-        {
-            viewerReservations = AIrConNewApiBridge.ListViewerReservations().Where(x => x.State.Equals("Scheduled", StringComparison.OrdinalIgnoreCase)).ToList();
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog("viewerReservations=Runtime scheduled=" + viewerReservations.Count);
-#endif
-        }
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-        catch (Exception ex) { SafeLog("viewerReservations exception=" + ex.Message); }
-#else
-        catch (Exception) { }
-#endif
-
-        try
-        {
-            sessions = CaptureViewerSessionsNewApi();
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog("viewerSessions=Runtime count=" + sessions.Count + " source=runtime_viewer_sessions");
-#endif
-        }
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-        catch (Exception ex) { SafeLog("viewerSessions exception=" + ex.Message); }
-#else
-        catch (Exception) { }
-#endif
-
-services = NormalizeViewerServiceAuthority(services);
-
-        // A successful empty Channels snapshot means no configured enabled stations.
-        // A failed Channels lookup is unknown, not evidence of GR/BS/CS reception.
-        // Never add ungrounded wave buttons after filtering the authoritative services.
-        var availableWaves = services.Select(x => NormalizeWaveFilter(x.ProgramGuideFilterGroup))
-            .Where(x => x is "GR" or "BS" or "CS" or "CATV")
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        waveFilters = waveFilters
-            .Where(x => availableWaves.Contains(NormalizeWaveFilter(x.Group)))
-            .ToList();
-        // A missing wave-filter catalogue must not hide stations the Channels API did return.
-        // Labels/order are canonically normalized by CanonicalWaveFilters at render time.
-        foreach (var wave in new[] { "GR", "BS", "CS", "CATV" })
-        {
-            if (availableWaves.Contains(wave) && !waveFilters.Any(x => NormalizeWaveFilter(x.Group) == wave))
-                waveFilters.Add(new WaveFilterRow(wave, wave, wave == "GR" ? "地上波" : wave));
-        }
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-        SafeLog("WAVE_VISIBILITY source=runtime_channels snapshot="
-            + (channelSnapshotReceived ? "received" : "failed_or_unavailable")
-            + " enabledServices=" + services.Count + " visibleWaves=" + string.Join(",", availableWaves)
-            + " filters=" + waveFilters.Count);
-#endif
-
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-        var zeroTripletFinal = services.Count(x => x.NetworkId <= 0 || x.TransportStreamId <= 0 || x.ServiceId <= 0);
-        if (zeroTripletFinal > 0) SafeLog("TRIPLET_DIAG finalZero=" + zeroTripletFinal);
-#endif
-
-        if (services.Count > 0 && sessions.Count > 0)
-        {
-            var map = services
-                .Where(x => HasResolvedTriplet(x))
-                .GroupBy(x => ServiceKey(x.NetworkId, x.TransportStreamId, x.ServiceId), StringComparer.OrdinalIgnoreCase)
-                .ToDictionary(x => x.Key, x => x.OrderBy(r => r.ProgramGuideOrder).First(), StringComparer.OrdinalIgnoreCase);
-            foreach (var s in sessions.OrderByDescending(x => x.Current).ThenByDescending(x => x.IsActive))
-            {
-                if (s.NetworkId == null || s.TransportStreamId == null || s.ServiceId == null) continue;
-                if (!map.TryGetValue(ServiceKey(s.NetworkId.Value, s.TransportStreamId.Value, s.ServiceId.Value), out var row)) continue;
-                row.IsViewing = true;
-                row.ViewingViewerProfile = s.ViewerProfile;
-            }
-        }
-
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-        var sessionHighlighted = services.Count(x => x.IsViewing);
-        SafeLog("currentRowHighlight source=viewer_session session=" + sessionHighlighted + " focusOverride=disabled");
-#endif
-
-        var filtered = services
-            .Where(x => x.ProgramGuideFilterGroup.Equals(filter, StringComparison.OrdinalIgnoreCase))
-            .OrderBy(x => x.ProgramGuideOrder)
-            .ToList();
-
-        #if AIRCON_DEVELOPER_DIAGNOSTICS
-        SafeLog("WAVE_CLASSIFICATION requested=" + filter
-            + " totalRows=" + services.Count
-            + " renderedCount=" + filtered.Count
-            + " rule=viewer_service_authority_triplet_overlay_only");
-        #endif
-
-        var serviceColumnWidth = CalculateServiceColumnWidth(services);
-
-        return new FloatingViewerData(filtered, sessions, tuners, waveFilters, viewerProfiles, programEvents, viewerReservations, projectionUsed, safeEventContractAvailable, safeDblclickEvents, serviceColumnWidth);
-    }
-
-    private static List<ServiceRow> NormalizeViewerServiceAuthority(IReadOnlyList<ServiceRow> source)
-    {
-        // AIrCon の局行は「視聴開始できる triplet 行」を正本にする。
-        // ProgramGuide/NowNext は番組名と時刻の overlay 専用で、局行の採否には使わない。
-        // ここでだけ invalid/duplicate を落とし、HTML/CSS 側で隠す後段処理は作らない。
-        var normalized = new List<ServiceRow>();
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-        var invalid = 0;
-        var duplicate = 0;
-#endif
-
-        foreach (var row in source.OrderBy(x => x.ProgramGuideOrder).ThenBy(x => x.ServiceName, StringComparer.OrdinalIgnoreCase))
-        {
-            if (!HasResolvedTriplet(row))
-            {
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-                invalid++;
-#endif
-                continue;
-            }
-
-            var key = ServiceKey(row.NetworkId, row.TransportStreamId, row.ServiceId);
-            if (!seen.Add(key))
-            {
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-                duplicate++;
-#endif
-                continue;
-            }
-
-            normalized.Add(row);
-        }
-
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-        AIrConNewApiBridge.LogInfo("AIrCon: serviceAuthority=viewer_start_triplet rows=" + normalized.Count
-            + " invalidDropped=" + invalid
-            + " duplicateDropped=" + duplicate
-            + " overlayDoesNotPrune=True");
-#endif
-        return normalized;
-    }
-
-    private static List<ViewerSessionRow> CaptureViewerSessionsNewApi()
-    {
-        try
-        {
-            return AIrConNewApiBridge.ListSessions()
-                .Select(s => new ViewerSessionRow(
-                    s.ViewerSessionId,
-                    s.CurrentService?.ServiceName ?? string.Empty,
-                    NormalizeFilter(string.Empty),
-                    string.Empty,
-                    string.Empty,
-                    string.Empty,
-                    string.Empty,
-                    0,
-                    s.CurrentService?.NetworkId,
-                    s.CurrentService?.TransportStreamId,
-                    s.CurrentService?.ServiceId,
-                    true,
-                    s.State,
-                    s.ViewerProfileId,
-                    s.ViewerProfileId,
-                    string.Empty,
-                    s.ViewerSessionId,
-                    s.Generation,
-                    s.ProcessId))
-                .OrderByDescending(x => x.Current)
-                .ThenByDescending(x => x.IsActive)
-                .ToList();
-        }
-        catch (Exception)
-        {
-            return new List<ViewerSessionRow>();
-        }
-    }
-
-    private static void ApplyRuntimeNowNext(List<ServiceRow> services, IReadOnlyList<TvAirProgramEventDto> events, DateTimeOffset now)
-    {
-        var byService = events
-            .Where(x => x.Start <= now && x.End > now)
-            .GroupBy(x => ServiceKey(x.NetworkId, x.TransportStreamId, x.ServiceId), StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(x => x.Key, x => x.OrderByDescending(e => e.Start).First(), StringComparer.OrdinalIgnoreCase);
-        foreach (var row in services)
-        {
-            if (!byService.TryGetValue(ServiceKey(row.NetworkId, row.TransportStreamId, row.ServiceId), out var current)) continue;
-            row.CurrentTitle = current.Title;
-            row.CurrentStart = current.Start;
-            row.CurrentEnd = current.End;
-            row.HasCurrentProgramProjection = true;
-        }
-    }
-
-    private ViewerOperation CaptureAction(RuntimeUiRenderContext c)
-    {
-        var contract = ReadStringDictionary(c, "ActionContract");
-        var endpoint = FirstNonEmpty(ReadString(c, "PluginActionEndpoint", "ActionEndpoint"), GetValue(contract, "endpoint"), GetValue(contract, "actionEndpoint"), "/api/plugins/action");
-        var route = FirstNonEmpty(ReadString(c, "PluginActionRoute", "ActionRoute"), GetValue(contract, "route"), GetValue(contract, "pluginActionRoute"), "/plugin-action");
-        var method = FirstNonEmpty(ReadString(c, "PluginActionMethod", "ActionMethod"), GetValue(contract, "method"), "POST");
-        var token = FirstNonEmpty(ReadString(c, "PluginActionToken", "ActionToken"), GetValue(contract, "token"), GetValue(contract, "actionToken"));
-        var pluginId = FirstNonEmpty(ReadString(c, "PluginId"), GetValue(contract, "pluginId"), PluginId);
-        var routeSegment = FirstNonEmpty(ReadString(c, "RouteSegment"), GetValue(contract, "routeSegment"), RouteSegment);
-        var supported = ReadStringList(c, "PluginSupportedActions", "SupportedActions");
-        var contractActions = SplitCsv(GetValue(contract, "actions"));
-        var canPost = method.Equals("POST", StringComparison.OrdinalIgnoreCase)
-            && !string.IsNullOrWhiteSpace(endpoint)
-            && !string.IsNullOrWhiteSpace(token)
-            && ((supported.Count == 0 && contractActions.Count == 0)
-                || supported.Any(x => x.Equals("viewerStart", StringComparison.OrdinalIgnoreCase))
-                || contractActions.Any(x => x.Equals("viewerStart", StringComparison.OrdinalIgnoreCase)));
-        return new ViewerOperation(canPost, endpoint, route, method, token, pluginId, routeSegment);
-    }
-
-    private WindowOperation CaptureWindow(RuntimeUiRenderContext c, bool isToolWindow)
-    {
-        var endpoint = FirstNonEmpty(ReadString(c, "WindowEndpoint"), "/api/plugins/window");
-        var route = FirstNonEmpty(ReadString(c, "WindowRoute"), "/plugin-window");
-        var method = FirstNonEmpty(ReadString(c, "WindowMethod"), "POST");
-        var contract = ReadStringDictionary(c, "WindowContract");
-        var token = FirstNonEmpty(ReadString(c, "WindowToken"), GetValue(contract, "token"));
-        var pluginId = FirstNonEmpty(ReadString(c, "PluginId"), GetValue(contract, "pluginId"), PluginId);
-        var routeSegment = FirstNonEmpty(ReadString(c, "RouteSegment"), RouteSegment);
-        var windowId = FirstNonEmpty(ReadString(c, "CurrentWindowId", "WindowId"), QueryWindowId(c));
-        var supported = ReadStringList(c, "SupportedWindowActions");
-        var capabilities = ReadStringDictionary(c, "ToolWindowCapabilities");
-        var modes = FirstNonEmpty(GetValue(capabilities, "openWindowModes"), GetValue(contract, "openWindowModes"));
-        var toolWindowSupported = ReadDictBool(capabilities, contract, "toolWindowSupported") || modes.Contains("toolWindow", StringComparison.OrdinalIgnoreCase);
-        var canOpen = method.Equals("POST", StringComparison.OrdinalIgnoreCase) && !isToolWindow && !string.IsNullOrWhiteSpace(endpoint);
-        var canRefresh = method.Equals("POST", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(endpoint)
-            && (supported.Count == 0 || supported.Any(x => x.Equals("refreshWindow", StringComparison.OrdinalIgnoreCase)) || supported.Any(x => x.Equals("rerenderWindow", StringComparison.OrdinalIgnoreCase)));
-        var stateEndpoint = ResolveWindowStateEndpoint(c, contract, windowId);
-        return new WindowOperation(canOpen, canRefresh && !string.IsNullOrWhiteSpace(windowId), endpoint, route, method, token, pluginId, routeSegment, windowId, stateEndpoint, toolWindowSupported);
-    }
-
-    private static string ResolveWindowStateEndpoint(RuntimeUiRenderContext c, IReadOnlyDictionary<string, string> contract, string windowId)
-    {
-        // Compatibility path only: current RenderHtml no longer calls this endpoint.
-        // TvAIr SDK contract supplies direct CurrentWindowAlwaysOnTop state instead.
-        var escapedWindowId = Uri.EscapeDataString(windowId ?? string.Empty);
-        var absolute = FirstNonEmpty(
-            ReadString(c, "CurrentWindowStateUrl", "WindowStateUrl", "AbsoluteWindowStateUrl", "CurrentWindowStateAbsoluteUrl"),
-            GetValue(contract, "currentWindowStateUrl"),
-            GetValue(contract, "windowStateUrl"),
-            GetValue(contract, "absoluteWindowStateUrl"));
-        if (!string.IsNullOrWhiteSpace(absolute)) return absolute.Replace("{windowId}", escapedWindowId, StringComparison.OrdinalIgnoreCase);
-
-        var direct = FirstNonEmpty(
-            ReadString(c, "CurrentWindowStateEndpoint", "WindowStateEndpoint"),
-            GetValue(contract, "currentWindowStateEndpoint"),
-            GetValue(contract, "stateEndpoint"));
-        if (!string.IsNullOrWhiteSpace(direct)) return direct.Replace("{windowId}", escapedWindowId, StringComparison.OrdinalIgnoreCase);
-
-        var template = FirstNonEmpty(
-            ReadString(c, "WindowStateUrlTemplate", "WindowStateEndpointTemplate"),
-            GetValue(contract, "windowStateUrlTemplate"),
-            GetValue(contract, "stateEndpointTemplate"),
-            GetValue(contract, "windowStateEndpointTemplate"));
-        if (!string.IsNullOrWhiteSpace(template)) return template.Replace("{windowId}", escapedWindowId, StringComparison.OrdinalIgnoreCase);
-
-        return !string.IsNullOrWhiteSpace(windowId) ? "/plugin-window/" + escapedWindowId + "/state" : string.Empty;
-    }
-
-    private bool ResolveWindowAlwaysOnTop(RuntimeUiRenderContext context, WindowOperation window, bool isToolWindow)
-    {
-        if (!isToolWindow || string.IsNullOrWhiteSpace(window.WindowId)) return false;
-
-        // TvAIr SDK contract: RenderHtml must not synchronously call WindowStateUrl.
-        // The host injects the current tool-window state directly into RuntimeUiRenderContext / WindowContract.
-        if (TryReadBoolProperty(context, out var directValue, "CurrentWindowAlwaysOnTop", "WindowAlwaysOnTop"))
-        {
-            return directValue;
-        }
-
-        if (TryReadBoolFromObject(ReadProperty(context, "CurrentWindowState"), "AlwaysOnTop", "alwaysOnTop", out var objectValue)
-            || TryReadBoolFromObject(ReadProperty(context, "WindowState"), "AlwaysOnTop", "alwaysOnTop", out objectValue))
-        {
-            return objectValue;
-        }
-
-        foreach (var mapName in new[] { "WindowContract", "ToolWindowCapabilities", "WindowState", "CurrentWindowState" })
-        {
-            var dict = ReadStringDictionary(context, mapName);
-            if (TryReadBoolFromDictionary(dict, "currentWindowAlwaysOnTop", out var dictValue)
-                || TryReadBoolFromDictionary(dict, "CurrentWindowAlwaysOnTop", out dictValue)
-                || TryReadBoolFromDictionary(dict, "alwaysOnTop", out dictValue)
-                || TryReadBoolFromDictionary(dict, "AlwaysOnTop", out dictValue))
-            {
-                return dictValue;
-            }
-        }
-
-        return false;
-    }
-
-    private static bool TryReadBoolProperty(object? obj, out bool value, params string[] names)
-    {
-        value = false;
-        if (obj == null) return false;
-        foreach (var name in names)
-        {
-            var prop = obj.GetType().GetProperty(name);
-            if (prop == null) continue;
-            try
-            {
-                var raw = prop.GetValue(obj);
-                if (raw is bool b) { value = b; return true; }
-                if (raw is string s && TryParseBool(s, out var parsed)) { value = parsed; return true; }
-            }
-            catch { }
-        }
-        return false;
-    }
-
-    private static bool TryReadBoolFromObject(object? obj, string name1, string name2, out bool value)
-    {
-        value = false;
-        if (obj == null) return false;
-        var raw = ReadProperty(obj, name1) ?? ReadProperty(obj, name2);
-        return TryParseBool(raw?.ToString(), out value);
-    }
-
-    private static bool TryReadBoolFromDictionary(IReadOnlyDictionary<string, string> dict, string key, out bool value)
-    {
-        value = false;
-        return dict.TryGetValue(key, out var raw) && TryParseBool(raw, out value);
-    }
-
-    private static bool TryParseBool(string? raw, out bool value)
-    {
-        value = false;
-        if (string.IsNullOrWhiteSpace(raw)) return false;
-        if (bool.TryParse(raw, out value)) return true;
-        if (raw == "1" || raw.Equals("on", StringComparison.OrdinalIgnoreCase)) { value = true; return true; }
-        if (raw == "0" || raw.Equals("off", StringComparison.OrdinalIgnoreCase)) { value = false; return true; }
-        return false;
-    }
-
-    private static AirConThemePalette ResolveThemePalette(RuntimeUiRenderContext context)
-    {
-        var dark = string.Equals(context?.HostEffectiveTheme, "dark", StringComparison.OrdinalIgnoreCase);
-        var contract = context?.ThemeContract;
-        string Role(string key, string lightFallback, string darkFallback)
-        {
-            if (contract != null && contract.TryGetValue(key, out var value) && IsSafeCssColor(value)) return value.Trim();
-            return dark ? darkFallback : lightFallback;
-        }
-
-        var page = Role("pageBackground", "#eef4f8", "#111820");
-        var surface = Role("surfaceBackground", "#d6e8f4", "#1b2732");
-        var subtle = Role("subtleBackground", "#e5f1f8", "#243441");
-        var input = Role("inputBackground", "#f8fbfd", "#18232d");
-        var text = Role("text", "#102334", "#f3f7fa");
-        var muted = Role("mutedText", "#27465a", "#c4d0d8");
-        var border = Role("border", "#8fb2c9", "#536978");
-        var accent = Role("accent", "#245b80", "#3c78a0");
-        var accentText = Role("accentText", "#ffffff", "#ffffff");
-        var focus = Role("focus", "#276f9e", "#77b7df");
-        var hover = dark ? "#2b3e4d" : "#e5f2fb";
-        var accentHover = dark ? "#4b8bb5" : "#1d4d6d";
-        var disabledBg = dark ? "#27313a" : "#edf2f5";
-        var disabledText = dark ? "#8f9da7" : "#708190";
-        var row = dark ? "#151f28" : "#ffffff";
-        var rowAlt = dark ? "#1b2832" : "#f2f8fc";
-        var buttonBg = dark ? "#18232d" : "#f8fbfd";
-        var buttonText = dark ? "#f3f7fa" : "#102f46";
-        var buttonBorder = dark ? "#536978" : "#6d94ad";
-        var buttonHover = dark ? "#2b3e4d" : "#e5f2fb";
-        var profileLabel = dark ? "#c4d0d8" : "#27465a";
-        var disabledBorder = dark ? "#46545f" : "#b6c4ce";
-        var refreshBg = dark ? "#1f3528" : "#edf8ef";
-        var refreshHover = dark ? "#294633" : "#dff2e3";
-        var refreshBorder = dark ? "#4f8c61" : "#5fa872";
-        var refreshText = dark ? "#bde9c8" : "#174820";
-        var powerBg = dark ? "#3b2525" : "#faeeee";
-        var powerHover = dark ? "#4b2d2d" : "#f5dddd";
-        var powerBorder = dark ? "#a86464" : "#c86a6a";
-        var powerText = dark ? "#f1bcbc" : "#7b1f1f";
-        var topmostBg = dark ? "#2a3137" : "#eceff2";
-        var topmostHover = dark ? "#343d45" : "#e1e7ec";
-        var topmostBorder = dark ? "#667785" : "#9aa7b0";
-        var topmostText = dark ? "#d5dde3" : "#3f4b54";
-        var viewingBg = dark ? "#5b4b22" : "#fff2bd";
-        var viewingHover = dark ? "#6b5928" : "#ffe9a2";
-        var viewingOtherBg = dark ? "#243c4f" : "#e7f2fb";
-        var viewingOtherHover = dark ? "#2d4a60" : "#dcecf7";
-        var zappingBg = dark ? "#5a3030" : "#ffdede";
-        var zappingHover = dark ? "#6c3838" : "#ffcaca";
-        var timeStart = dark ? "#9fc6e8" : "#4f6f9f";
-        var timeEnd = dark ? "#e4a7a7" : "#9a5a5a";
-        var statusBorder = dark ? "#607887" : "#9bbccd";
-        var statusOffBg = dark ? "#233540" : "#edf7fc";
-        var statusOffBorder = dark ? "#4b7186" : "#a9c9da";
-        var statusOffText = dark ? "#b8d8e8" : "#315f78";
-        var statusOnBg = dark ? "#493d25" : "#fff8e8";
-        var statusOnBorder = dark ? "#8f784c" : "#b69d73";
-        var statusOnText = dark ? "#f0d9a9" : "#5d4723";
-        var controlText = dark ? "#d8e6ef" : "#12384f";
-        var controlBorder = dark ? "#607d8e" : "#789db3";
-        var controlHover = dark ? "#2b3e4d" : "#eef7fc";
-        var controlHoverBorder = dark ? "#7aa2b9" : "#5f8faa";
-        var controlOnBg = dark ? "#4b2d2d" : "#fff0f0";
-        var controlOnText = dark ? "#f1bcbc" : "#7a2020";
-        var controlOnBorder = dark ? "#a86464" : "#cf9292";
-        var powerDisabledBg = dark ? "#342828" : "#f2e6e6";
-        var powerDisabledBorder = dark ? "#755454" : "#cfa0a0";
-        var powerDisabledText = dark ? "#aa8c8c" : "#8a6868";
-        var topmostOnBg = dark ? "#a83e3e" : "#cf4b4b";
-        var topmostOnHover = dark ? "#bc4a4a" : "#bd3838";
-        var topmostOnBorder = dark ? "#d06b6b" : "#9b2222";
-        var topmostOnText = "#ffffff";
-        var topmostDisabledBg = dark ? "#2b3237" : "#edf0f2";
-        var topmostDisabledBorder = dark ? "#56636d" : "#c0c8ce";
-        var topmostDisabledText = dark ? "#89969f" : "#87939b";
-
-        return new AirConThemePalette(new Dictionary<string, string>(StringComparer.Ordinal)
-        {
-            ["--aircon-page"] = page,
-            ["--aircon-surface"] = surface,
-            ["--aircon-subtle"] = subtle,
-            ["--aircon-input"] = input,
-            ["--aircon-text"] = text,
-            ["--aircon-muted"] = muted,
-            ["--aircon-border"] = border,
-            ["--aircon-accent"] = accent,
-            ["--aircon-accent-hover"] = accentHover,
-            ["--aircon-accent-text"] = accentText,
-            ["--aircon-focus"] = focus,
-            ["--aircon-hover"] = hover,
-            ["--aircon-disabled-bg"] = disabledBg,
-            ["--aircon-disabled-text"] = disabledText,
-            ["--aircon-row"] = row,
-            ["--aircon-row-alt"] = rowAlt,
-            ["--aircon-button-bg"] = buttonBg,
-            ["--aircon-button-text"] = buttonText,
-            ["--aircon-button-border"] = buttonBorder,
-            ["--aircon-button-hover"] = buttonHover,
-            ["--aircon-profile-label"] = profileLabel,
-            ["--aircon-disabled-border"] = disabledBorder,
-            ["--aircon-refresh-bg"] = refreshBg,
-            ["--aircon-refresh-hover"] = refreshHover,
-            ["--aircon-refresh-border"] = refreshBorder,
-            ["--aircon-refresh-text"] = refreshText,
-            ["--aircon-power-bg"] = powerBg,
-            ["--aircon-power-hover"] = powerHover,
-            ["--aircon-power-border"] = powerBorder,
-            ["--aircon-power-text"] = powerText,
-            ["--aircon-topmost-bg"] = topmostBg,
-            ["--aircon-topmost-hover"] = topmostHover,
-            ["--aircon-topmost-border"] = topmostBorder,
-            ["--aircon-topmost-text"] = topmostText,
-            ["--aircon-viewing-bg"] = viewingBg,
-            ["--aircon-viewing-hover"] = viewingHover,
-            ["--aircon-viewing-other-bg"] = viewingOtherBg,
-            ["--aircon-viewing-other-hover"] = viewingOtherHover,
-            ["--aircon-zapping-bg"] = zappingBg,
-            ["--aircon-zapping-hover"] = zappingHover,
-            ["--aircon-time-start"] = timeStart,
-            ["--aircon-time-end"] = timeEnd,
-            ["--aircon-status-border"] = statusBorder,
-            ["--aircon-status-off-bg"] = statusOffBg,
-            ["--aircon-status-off-border"] = statusOffBorder,
-            ["--aircon-status-off-text"] = statusOffText,
-            ["--aircon-status-on-bg"] = statusOnBg,
-            ["--aircon-status-on-border"] = statusOnBorder,
-            ["--aircon-status-on-text"] = statusOnText,
-            ["--aircon-control-text"] = controlText,
-            ["--aircon-control-border"] = controlBorder,
-            ["--aircon-control-hover"] = controlHover,
-            ["--aircon-control-hover-border"] = controlHoverBorder,
-            ["--aircon-control-on-bg"] = controlOnBg,
-            ["--aircon-control-on-text"] = controlOnText,
-            ["--aircon-control-on-border"] = controlOnBorder,
-            ["--aircon-power-disabled-bg"] = powerDisabledBg,
-            ["--aircon-power-disabled-border"] = powerDisabledBorder,
-            ["--aircon-power-disabled-text"] = powerDisabledText,
-            ["--aircon-topmost-on-bg"] = topmostOnBg,
-            ["--aircon-topmost-on-hover"] = topmostOnHover,
-            ["--aircon-topmost-on-border"] = topmostOnBorder,
-            ["--aircon-topmost-on-text"] = topmostOnText,
-            ["--aircon-topmost-disabled-bg"] = topmostDisabledBg,
-            ["--aircon-topmost-disabled-border"] = topmostDisabledBorder,
-            ["--aircon-topmost-disabled-text"] = topmostDisabledText,
-        });
-    }
-
-    private sealed record AirConThemePalette(IReadOnlyDictionary<string, string> Colors)
-    {
-        public string Apply(string css)
-        {
-            var resolved = css;
-            foreach (var pair in Colors)
-            {
-                resolved = resolved.Replace("var(" + pair.Key + ")", pair.Value, StringComparison.Ordinal);
-            }
-
-            if (resolved.Contains("var(--aircon-", StringComparison.Ordinal))
-                throw new InvalidOperationException("AIrCon theme palette did not resolve every semantic color token.");
-
-            return resolved;
-        }
-    }
-
-    private static bool IsSafeCssColor(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value)) return false;
-        var v = value.Trim();
-        if (v.Length > 64) return false;
-        return v.StartsWith("#", StringComparison.Ordinal) ||
-               v.StartsWith("rgb(", StringComparison.OrdinalIgnoreCase) ||
-               v.StartsWith("rgba(", StringComparison.OrdinalIgnoreCase) ||
-               v.StartsWith("hsl(", StringComparison.OrdinalIgnoreCase) ||
-               v.StartsWith("hsla(", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static string BuildLauncherHtml(RuntimeUiRenderContext context, FloatingViewerData data, WindowOperation window, string filter, string selectedTuner, string selectedViewerProfile, bool alwaysOnTop)
-    {
-        var openForm = BuildOpenWindowForm(window, alwaysOnTop, filter, selectedTuner, selectedViewerProfile);
-        return $$"""
-<!doctype html>
-<meta charset="utf-8">
-<style>
-{{BuildLauncherCss(context)}}
-</style>
-<div class="aircon-launch">
-  <div class="aircon-card">
-    <div class="aircon-head">AIrCon</div>
-    <div class="aircon-body">
-      {{openForm}}
-    </div>
-  </div>
-</div>
-""";
-    }
-
-    private static string BuildLauncherCss(RuntimeUiRenderContext context)
-    {
-        return ResolveThemePalette(context).Apply(@"html,body{margin:0;background:var(--aircon-page);color:var(--aircon-text);font-family:Meiryo,""Yu Gothic"",Arial,sans-serif;font-size:13px;}
-.aircon-launch{padding:12px;}
-.aircon-card{width:260px;max-width:100%;background:var(--aircon-surface);border:1px solid var(--aircon-border);box-shadow:0 1px 3px rgba(0,0,0,.25);}
-.aircon-head{background:var(--aircon-subtle);color:var(--aircon-text);padding:6px 9px;font-weight:bold;}
-.aircon-body{padding:10px;line-height:1.35;}
-.aircon-open{font-family:inherit;border:1px solid var(--aircon-button-border);background:var(--aircon-accent);color:var(--aircon-accent-text);border-radius:3px;padding:5px 11px;font-weight:bold;cursor:pointer;}
-.aircon-open:hover{background:var(--aircon-accent-hover);}
-.aircon-note,.aircon-status{display:none;}");
-    }
-
-    private static string BuildFloatingViewerHtml(RuntimeUiRenderContext context, FloatingViewerData data, ViewerOperation action, WindowOperation window, string filter, string selectedTunerValue, ViewerProfileChoice selectedViewerProfile, bool alwaysOnTop, bool zappingActive, string activeZappingWave, DateTimeOffset? powerOffDeadline)
-    {
-        var tunerChoices = BuildTunerChoices(data.ViewerTuners, filter).ToList();
-        var selected = ResolveSelectedTuner(tunerChoices, selectedTunerValue);
-        var rows = BuildRows(context, data.Services, data.ViewerSessions, action, window, selected, selectedViewerProfile, filter, zappingActive, activeZappingWave, powerOffDeadline);
-        var reservationMenu = BuildViewerReservationMenu(context, data, action, window, filter, selectedViewerProfile.Value);
-        var toolbar = BuildToolbar(context, data.WaveFilters, data.ViewerSessions, data.ViewerProfiles, action, window, filter, selected.Value, selectedViewerProfile, alwaysOnTop);
-        return $$"""
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-{{BuildToolWindowCss(context, data.ServiceColumnWidthPx)}}
-</style>
-</head>
-<body class="aircon-runtime-root">
-<div class="aircon-float">
-  {{toolbar}}
-  <div class="aircon-list" id="aircon-service-list">
-    {{rows}}
-  </div>
-  {{reservationMenu}}
-  <script>
-  (function(){
-    var list=document.getElementById('aircon-service-list');
-    var row=document.getElementById('aircon-current-viewing-anchor');
-    if(list&&row){
-      var top=row.offsetTop-Math.floor((list.clientHeight-row.offsetHeight)/2);
-      list.scrollTop=Math.max(0,top);
-    }
-    var menu=document.getElementById('aircon-reservation-menu');
-    if(!list||!menu)return;
-    var marqueeDelayMs=400,marqueeSpeedPxPerSec=54;
-    var marqueeDelay=0,marqueeFrame=0,marqueeTarget=null,marqueeStart=0;
-    function clearMarquee(target){
-      var owns=!target||target===marqueeTarget;
-      if(owns){
-        if(marqueeDelay){window.clearTimeout(marqueeDelay);marqueeDelay=0;}
-        if(marqueeFrame){window.cancelAnimationFrame(marqueeFrame);marqueeFrame=0;}
-      }
-      var el=target||(owns?marqueeTarget:null);
-      if(el){var track=el.querySelector('.aircon-current-track');if(track)track.style.transform='translateX(0px)';el.classList.remove('aircon-current-marquee');var copy=el.querySelector('.aircon-current-copy');if(copy)copy.style.marginLeft='';}
-      if(owns)marqueeTarget=null;
-    }
-    function measureMarquee(el){
-      var text=el&&el.querySelector('.aircon-current-text');
-      if(!text)return null;
-      var available=el.clientWidth,textWidth=text.scrollWidth;
-      if(available<=0||textWidth<=available+1)return null;
-      return {available:available,textWidth:textWidth,gap:Math.max(28,Math.floor(available/3))};
-    }
-    function marqueeTick(now){
-      var el=marqueeTarget;if(!el)return;
-      var m=measureMarquee(el);if(!m){clearMarquee();return;}
-      var track=el.querySelector('.aircon-current-track');if(!track){clearMarquee();return;}
-      var travel=Math.max(1,m.textWidth+m.gap);
-      var phase=((now-marqueeStart)*marqueeSpeedPxPerSec/1000)%travel;
-      track.style.transform='translateX('+(-phase)+'px)';
-      marqueeFrame=window.requestAnimationFrame(marqueeTick);
-    }
-    function startMarquee(el){
-      clearMarquee();
-      var m=measureMarquee(el);if(!m)return;
-      marqueeTarget=el;
-      marqueeDelay=window.setTimeout(function(){
-        marqueeDelay=0;if(marqueeTarget!==el)return;
-        var latest=measureMarquee(el);if(!latest){clearMarquee();return;}
-        var copy=el.querySelector('.aircon-current-copy');if(copy)copy.style.marginLeft=latest.gap+'px';
-        el.classList.add('aircon-current-marquee');
-        marqueeStart=window.performance&&window.performance.now?window.performance.now():Date.now();
-        marqueeFrame=window.requestAnimationFrame(marqueeTick);
-      },marqueeDelayMs);
-    }
-    var marqueeItems=list.querySelectorAll('.aircon-current[data-aircon-marquee=\"true\"]');
-    for(var mi=0;mi<marqueeItems.length;mi++){
-      (function(el){el.addEventListener('mouseenter',function(){startMarquee(el);});el.addEventListener('mouseleave',function(){clearMarquee(el);});})(marqueeItems[mi]);
-    }
-    window.addEventListener('resize',function(){
-      if(!marqueeTarget)return;
-      var el=marqueeTarget;var latest=measureMarquee(el);
-      if(!latest){clearMarquee();return;}
-      var copy=el.querySelector('.aircon-current-copy');if(copy)copy.style.marginLeft=latest.gap+'px';
-    });
-    function closeMenu(){menu.style.display='none';var sections=menu.getElementsByClassName('aircon-reservation-section');for(var i=0;i<sections.length;i++)sections[i].style.display='none';}
-    list.oncontextmenu=function(ev){
-      ev=ev||window.event;var el=ev.target||ev.srcElement;
-      while(el&&el!==list&&!((' '+el.className+' ').indexOf(' aircon-row ')>=0))el=el.parentNode;
-      if(!el||el===list||!el.getAttribute('data-aircon-service-id'))return true;
-      if(ev.preventDefault)ev.preventDefault();ev.returnValue=false;
-      closeMenu();
-      var section=document.getElementById('aircon-reservation-'+el.getAttribute('data-aircon-service-id'));
-      if(!section)return false;
-      section.style.display='block';menu.style.display='block';
-      var x=ev.clientX||0,y=ev.clientY||0;menu.style.left=x+'px';menu.style.top=y+'px';
-      var r=menu.getBoundingClientRect();
-      if(r.right>document.documentElement.clientWidth)menu.style.left=Math.max(0,document.documentElement.clientWidth-r.width-4)+'px';
-      if(r.bottom>document.documentElement.clientHeight)menu.style.top=Math.max(0,document.documentElement.clientHeight-r.height-4)+'px';
-      return false;
-    };
-    document.onclick=function(ev){var t=(ev||window.event).target||window.event.srcElement;if(menu.style.display==='block'&&!menu.contains(t))closeMenu();};
-    document.onkeydown=function(ev){ev=ev||window.event;if(ev.keyCode===27)closeMenu();};
-    list.onscroll=function(){closeMenu();clearMarquee();};
-  })();
-  </script>
-</div>
-</body>
-</html>
-""";
-    }
-
-    private static string BuildToolWindowCss(RuntimeUiRenderContext context, int serviceColumnWidthPx)
-    {
-        var toolbarHeight = ToolWindowToolbarHeightPx;
-        var toolbarContentTop = ToolWindowToolbarContentTopPx;
-        var toolbarPaddingX = ToolWindowToolbarPaddingXPx;
-        var toolbarCellGap = ToolWindowToolbarCellGapPx;
-        var toolbarGroupGap = ToolWindowToolbarGroupGapPx;
-        var toolbarLabelPaddingRight = ToolWindowToolbarLabelPaddingRightPx;
-        var waveButtonWidth = ToolWindowWaveButtonWidthPx;
-        var waveAreaWidth = ToolWindowWaveAreaWidthPx;
-        var viewerProfileButtonWidth = ToolWindowViewerProfileNumericButtonWidthPx;
-        var actionButtonSize = ToolWindowActionButtonSizePx;
-        var actionButtonGroupWidth = ToolWindowActionButtonGroupWidthPx;
-        var waveButtonGroupWidth = ToolWindowWaveButtonGroupWidthPx;
-        var waveButtonOverlap = ToolWindowWaveButtonOverlapPx;
-        var buttonHeight = ToolWindowToolbarButtonHeightPx;
-        var buttonLineHeight = ToolWindowButtonLineHeightPx;
-        var buttonBorder = ToolWindowButtonBorderPx;
-        var cellHeight = ToolWindowToolbarCellHeightPx;
-        var listTop = ToolWindowListTopPx;
-        var rowHeight = ToolWindowRowHeightPx;
-        var serviceWidth = Math.Max(ToolWindowServiceColumnMinimumWidthPx, Math.Min(ToolWindowServiceColumnMaximumWidthPx, serviceColumnWidthPx));
-        var timeWidth = ToolWindowTimeColumnWidthPx;
-        
-        return ResolveThemePalette(context).Apply($$"""
-html,body{margin:0;padding:0;width:100%;height:100%;min-width:0;min-height:{{ToolWindowMinimumHeightPx}}px;background:var(--aircon-page);color:var(--aircon-text);font-family:Meiryo,"Yu Gothic",Arial,sans-serif;font-size:12px;overflow:hidden;}
-body.aircon-runtime-root{position:static;}
-.aircon-runtime-root,.aircon-runtime-root *{box-sizing:border-box;}
-.aircon-float{position:static;width:100%;height:100%;min-width:0;min-height:{{ToolWindowMinimumHeightPx}}px;background:var(--aircon-page);overflow:hidden;}
-.aircon-toolbar{position:fixed;left:0;right:0;top:0;height:{{toolbarHeight}}px;padding:0;border-bottom:{{ToolWindowToolbarSeparatorPx}}px solid var(--aircon-border);background:var(--aircon-surface);white-space:nowrap;overflow:hidden;text-align:left;z-index:2;}
-.aircon-toolbar-inner{position:absolute;left:{{toolbarPaddingX}}px;right:{{toolbarPaddingX}}px;top:{{toolbarContentTop}}px;height:{{buttonHeight}}px;overflow:hidden;white-space:nowrap;}
-.aircon-toolbar-wave-area{position:absolute;left:0;top:0;width:{{waveAreaWidth}}px;height:{{cellHeight}}px;line-height:{{cellHeight}}px;white-space:nowrap;overflow:hidden;}
-.aircon-toolbar-profile-slot{position:absolute;left:{{waveAreaWidth + toolbarGroupGap}}px;right:{{actionButtonGroupWidth + toolbarGroupGap}}px;top:0;width:auto;height:{{cellHeight}}px;line-height:{{cellHeight}}px;white-space:nowrap;overflow:hidden;}
-.aircon-toolbar-profile-slot-reserved{visibility:hidden;}
-.aircon-toolbar-actions{position:absolute;right:0;top:0;width:{{actionButtonGroupWidth}}px;height:{{cellHeight}}px;display:flex;flex-direction:row;justify-content:flex-end;align-items:flex-start;gap:{{toolbarCellGap}}px;white-space:nowrap;overflow:visible;}
-.aircon-toolbar-label{display:inline-block;height:{{cellHeight}}px;line-height:{{buttonLineHeight}}px;margin:0;padding:{{buttonBorder}}px {{toolbarLabelPaddingRight}}px {{buttonBorder}}px 0;color:var(--aircon-muted);font-size:11px;font-weight:bold;vertical-align:top;white-space:nowrap;}
-.aircon-wave-group{display:inline-block;margin:0;padding:0;width:{{waveButtonGroupWidth}}px;height:{{cellHeight}}px;line-height:{{cellHeight}}px;white-space:nowrap;vertical-align:top;overflow:visible;}
-.aircon-nav-form,.aircon-action-form,.aircon-profile-form{display:inline-block;margin:0;padding:0;height:{{cellHeight}}px;line-height:{{cellHeight}}px;white-space:nowrap;vertical-align:top;}
-.aircon-toolbar-actions .aircon-action-form{width:{{actionButtonSize}}px;margin:0;}
-.aircon-wave-group .aircon-nav-form{margin:0 0 0 -{{waveButtonOverlap}}px;}
-.aircon-wave-group .aircon-nav-form:first-child{margin-left:0;}
-.aircon-toolbar-button,.aircon-toolbar-select{display:inline-block;height:{{buttonHeight}}px;line-height:{{buttonLineHeight}}px;padding:0 6px;margin:0;border:{{buttonBorder}}px solid var(--aircon-button-border);background:var(--aircon-button-bg);color:var(--aircon-button-text);border-radius:2px;font-size:11px;font-family:inherit;font-weight:bold;text-align:center;cursor:pointer;vertical-align:top;white-space:nowrap;text-decoration:none;}
-.aircon-toolbar-button:hover,.aircon-toolbar-select:hover{background:var(--aircon-button-hover);}
-.aircon-toolbar-button:focus,.aircon-toolbar-select:focus{outline:1px solid var(--aircon-focus);outline-offset:1px;}
-.aircon-toolbar-button-disabled:hover,.aircon-profile-button-disabled:hover{background:var(--aircon-disabled-bg);color:var(--aircon-disabled-text);}
-.aircon-profile-label{display:inline-block;width:auto;height:{{cellHeight}}px;line-height:{{buttonLineHeight}}px;margin:0;padding:{{buttonBorder}}px {{toolbarLabelPaddingRight}}px {{buttonBorder}}px 0;color:var(--aircon-profile-label);font-size:11px;font-weight:bold;vertical-align:top;white-space:nowrap;overflow:visible;text-align:left;}
-.aircon-profile-segments{display:inline-block;width:auto;height:{{cellHeight}}px;line-height:{{cellHeight}}px;white-space:nowrap;overflow:visible;vertical-align:top;}
-.aircon-profile-segment-form{display:inline-block;margin:0 {{toolbarCellGap}}px 0 0;padding:0;width:{{viewerProfileButtonWidth}}px;height:{{cellHeight}}px;line-height:{{cellHeight}}px;vertical-align:top;white-space:nowrap;overflow:visible;}
-.aircon-profile-button{width:{{viewerProfileButtonWidth}}px;min-width:{{viewerProfileButtonWidth}}px;max-width:{{viewerProfileButtonWidth}}px;height:{{buttonHeight}}px;line-height:{{buttonLineHeight}}px;padding:0;text-align:center;}
-.aircon-profile-button-on{background:var(--aircon-accent);color:var(--aircon-accent-text);border-color:var(--aircon-button-border);}
-.aircon-profile-button-on:hover,.aircon-profile-button-on:focus,.aircon-profile-button-on:active{background:var(--aircon-accent);color:var(--aircon-accent-text);border-color:var(--aircon-button-border);}
-.aircon-profile-button-disabled{opacity:.45;cursor:default;background:var(--aircon-disabled-bg);color:var(--aircon-disabled-text);}
-.aircon-toolbar-button-disabled{opacity:.70;cursor:default;background:var(--aircon-disabled-bg);color:var(--aircon-disabled-text);}
-.aircon-toolbar-wave-area.aircon-wave-four .aircon-wave-group{width:153px;}
-.aircon-toolbar-wave-area.aircon-wave-four .aircon-wave-button{width:39px;min-width:39px;max-width:39px;padding-left:0;padding-right:0;text-align:center;}
-.aircon-wave-button{width:{{waveButtonWidth}}px;min-width:{{waveButtonWidth}}px;border-radius:0;background:var(--aircon-button-bg);border-color:var(--aircon-button-border);color:var(--aircon-button-text);}
-.aircon-wave-button-on{background:var(--aircon-accent);color:var(--aircon-accent-text);border-color:var(--aircon-button-border);}
-.aircon-wave-button-on:hover,.aircon-wave-button-on:focus,.aircon-wave-button-on:active{background:var(--aircon-accent);color:var(--aircon-accent-text);border-color:var(--aircon-button-border);}
-.aircon-wave-button-disabled,.aircon-wave-button-disabled:hover{background:var(--aircon-disabled-bg);color:var(--aircon-disabled-text);border-color:var(--aircon-disabled-border);cursor:default;}
-.aircon-action-button{width:{{actionButtonSize}}px;min-width:{{actionButtonSize}}px;max-width:{{actionButtonSize}}px;padding:0;font-size:15px;font-family:"Segoe UI Symbol","Meiryo","Yu Gothic",Arial,sans-serif;font-weight:bold;line-height:{{buttonLineHeight}}px;text-align:center;}
-.aircon-action-refresh{background:var(--aircon-refresh-bg);border-color:var(--aircon-refresh-border);color:var(--aircon-refresh-text);}
-.aircon-action-refresh:hover{background:var(--aircon-refresh-hover);}
-.aircon-action-settings{font-size:14px;}
-.aircon-action-power{background:var(--aircon-power-bg);border-color:var(--aircon-power-border);color:var(--aircon-power-text);}
-.aircon-action-power:hover{background:var(--aircon-power-hover);}
-.aircon-action-power.aircon-toolbar-button-disabled{background:var(--aircon-power-disabled-bg);border-color:var(--aircon-power-disabled-border);color:var(--aircon-power-disabled-text);}
-.aircon-action-topmost{background:var(--aircon-topmost-bg);border-color:var(--aircon-topmost-border);color:var(--aircon-topmost-text);}
-.aircon-action-topmost:hover{background:var(--aircon-topmost-hover);}
-.aircon-action-topmost-on{background:var(--aircon-topmost-on-bg);border-color:var(--aircon-topmost-on-border);color:var(--aircon-topmost-on-text);}
-.aircon-action-topmost-on:hover{background:var(--aircon-topmost-on-hover);}
-.aircon-action-topmost.aircon-toolbar-button-disabled{background:var(--aircon-topmost-disabled-bg);border-color:var(--aircon-topmost-disabled-border);color:var(--aircon-topmost-disabled-text);}
-.aircon-list{position:fixed;left:0;right:0;top:{{listTop}}px;bottom:0;background:var(--aircon-page);overflow-x:hidden;overflow-y:scroll;width:100%;height:auto;}
-.aircon-row{display:block;position:relative;width:100%;margin:0;padding:0 8px;border:0;border-bottom:1px solid var(--aircon-border);background:var(--aircon-row);cursor:pointer;font-family:inherit;text-align:left;color:var(--aircon-text);height:{{rowHeight}}px;line-height:{{rowHeight}}px;white-space:nowrap;overflow:hidden;}
-.aircon-row-even{background:var(--aircon-row-alt);}
-.aircon-row-odd{background:var(--aircon-row);}
-.aircon-row:hover{background:var(--aircon-hover);}
-.aircon-row:focus,.aircon-row:active{outline:none;}
-.aircon-row-disabled,.aircon-row-disabled:hover{cursor:default;color:var(--aircon-disabled-text);background:var(--aircon-disabled-bg);}
-.aircon-row-viewing-selected{background:var(--aircon-viewing-bg);cursor:pointer;}
-.aircon-row-viewing-other{background:var(--aircon-viewing-other-bg);cursor:pointer;}
-.aircon-viewer-tune-form{display:block;margin:0;padding:0;border:0;}
-.aircon-row-zapping-selected{background:var(--aircon-zapping-bg);cursor:pointer;}
-.aircon-row-zapping-selected:hover{background:var(--aircon-zapping-hover);}
-.aircon-row-viewing-selected:hover{background:var(--aircon-viewing-hover);}
-.aircon-row-viewing-other:hover{background:var(--aircon-viewing-other-hover);}
-.aircon-row span{cursor:inherit;}
-.aircon-service{position:absolute;left:8px;top:0;display:block;width:{{serviceWidth}}px;height:{{rowHeight}}px;line-height:{{rowHeight}}px;vertical-align:top;color:var(--aircon-text);font-weight:bold;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-.aircon-time{position:absolute;left:{{8 + serviceWidth}}px;top:0;display:block;width:{{timeWidth}}px;height:{{rowHeight}}px;margin:0;padding:3px 2px 0 0;text-align:center;vertical-align:top;white-space:nowrap;overflow:hidden;font-size:10px;line-height:11px;font-weight:bold;}
-.aircon-time-start,.aircon-time-end{display:block;height:11px;line-height:11px;margin:0;padding:0;white-space:nowrap;overflow:hidden;}
-.aircon-time-start{color:var(--aircon-time-start);}
-.aircon-time-end{color:var(--aircon-time-end);}
-.aircon-current{position:absolute;left:{{8 + serviceWidth + timeWidth}}px;right:8px;top:0;display:block;width:auto;margin:0;height:{{rowHeight}}px;line-height:{{rowHeight}}px;vertical-align:top;color:var(--aircon-text);font-size:12px;font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:clip;}
-.aircon-current-track{display:inline-flex;align-items:center;height:100%;line-height:inherit;white-space:nowrap;will-change:transform;transform:translateX(0);}
-.aircon-current-copy{display:none;}
-.aircon-current-marquee .aircon-current-copy{display:inline-block;}
-.aircon-float [hidden]{display:none;}
-.aircon-scroll-anchor{display:block;width:100%;height:1px;line-height:1px;font-size:0;overflow:hidden;margin:0;padding:0;}
-.aircon-zapping-bar{display:flex;position:relative;align-items:center;justify-content:space-between;gap:8px;min-width:0;margin:0;padding:5px 8px;border-top:1px solid var(--aircon-border);background:var(--aircon-subtle);white-space:nowrap;overflow:hidden;box-sizing:border-box;}
-.aircon-zapping-left,.aircon-sleep-right{display:flex;align-items:center;gap:0;min-width:0;height:24px;}
-.aircon-zapping-left{flex:0 1 auto;overflow:hidden;}
-.aircon-sleep-right{flex:0 0 auto;margin-left:auto;padding-left:9px;border-left:1px solid var(--aircon-border);}
-.aircon-zapping-label,.aircon-sleep-label{display:inline-flex;align-items:center;margin:0 7px 0 0;height:22px;line-height:22px;color:var(--aircon-muted);font-size:11px;font-weight:bold;vertical-align:middle;white-space:nowrap;}
-.aircon-zapping-status{display:inline-flex;align-items:center;justify-content:center;min-width:42px;margin:0 9px 0 0;padding:0 7px;height:22px;line-height:20px;color:var(--aircon-muted);font-size:10px;font-weight:bold;text-align:center;vertical-align:middle;overflow:hidden;text-overflow:ellipsis;border:1px solid var(--aircon-status-border);border-radius:11px;box-sizing:border-box;}
-.aircon-zapping-status-off{background:var(--aircon-status-off-bg);border-color:var(--aircon-status-off-border);color:var(--aircon-status-off-text);}
-.aircon-zapping-status-on,.aircon-sleep-remaining{background:var(--aircon-status-on-bg);border-color:var(--aircon-status-on-border);color:var(--aircon-status-on-text);}
-.aircon-zapping-form,.aircon-sleep-form{display:inline-flex;align-items:center;margin:0;padding:0;vertical-align:middle;}
-.aircon-zapping-button,.aircon-sleep-button,.aircon-sleep-select{display:inline-block;height:22px;line-height:20px;margin:0;border:1px solid var(--aircon-control-border);background:var(--aircon-input);color:var(--aircon-control-text);border-radius:3px;font-size:11px;font-family:inherit;font-weight:bold;text-align:center;vertical-align:middle;box-sizing:border-box;}
-.aircon-zapping-button{min-width:44px;padding:0 8px;cursor:pointer;}
-.aircon-sleep-button{min-width:38px;padding:0 6px;cursor:pointer;}
-.aircon-sleep-select{width:45px;padding:0 2px;cursor:pointer;}
-.aircon-zapping-button:hover,.aircon-sleep-button:hover{background:var(--aircon-control-hover);border-color:var(--aircon-control-hover-border);}
-.aircon-zapping-button-on,.aircon-sleep-button-on{background:var(--aircon-control-on-bg);color:var(--aircon-control-on-text);border-color:var(--aircon-control-on-border);}
-.aircon-zapping-button-on:hover,.aircon-zapping-button-on:focus,.aircon-zapping-button-on:active,.aircon-sleep-button-on:hover,.aircon-sleep-button-on:focus,.aircon-sleep-button-on:active{background:var(--aircon-control-on-bg);color:var(--aircon-control-on-text);border-color:var(--aircon-control-on-border);}
-.aircon-sleep-select,.aircon-sleep-remaining{margin-right:9px;}
-.aircon-sleep-remaining{display:inline-flex;align-items:center;justify-content:center;min-width:45px;height:22px;line-height:20px;padding:0 4px;border:1px solid;border-radius:3px;box-sizing:border-box;font-size:11px;font-weight:bold;text-align:center;vertical-align:middle;}
-.aircon-sleep-hidden{display:none;}
-.aircon-reservation-menu{display:none;position:fixed;z-index:20;min-width:300px;max-width:440px;max-height:70%;overflow-y:auto;background:var(--aircon-surface);border:1px solid var(--aircon-border);box-shadow:0 3px 10px rgba(0,0,0,.35);padding:3px;}
-.aircon-reservation-section{display:none;}
-.aircon-reservation-program{display:block;position:relative;min-height:34px;padding:4px 76px 4px 6px;border-bottom:1px solid var(--aircon-border);background:var(--aircon-row);}
-.aircon-reservation-program:last-child{border-bottom:0;}
-.aircon-reservation-time{display:block;color:var(--aircon-muted);font-size:10px;line-height:12px;}
-.aircon-reservation-title{display:block;color:var(--aircon-text);font-size:11px;font-weight:bold;line-height:15px;white-space:normal;}
-.aircon-reservation-targets{position:absolute;right:5px;top:6px;display:flex;gap:3px;}
-.aircon-reservation-target{min-width:30px;height:22px;padding:0 5px;border:1px solid var(--aircon-control-border);background:var(--aircon-input);color:var(--aircon-control-text);border-radius:3px;font:700 11px Meiryo,"Yu Gothic",Arial,sans-serif;cursor:pointer;}
-.aircon-reservation-target:hover{background:var(--aircon-control-hover);border-color:var(--aircon-control-hover-border);}
-.aircon-reservation-target-on{background:var(--aircon-accent);color:var(--aircon-accent-text);border-color:var(--aircon-button-border);}
-.aircon-reservation-target-conflict,.aircon-reservation-target:disabled{opacity:.42;cursor:default;background:var(--aircon-disabled-bg);color:var(--aircon-disabled-text);border-color:var(--aircon-disabled-border);}
-.aircon-reservation-empty{padding:9px;color:var(--aircon-muted);font-size:11px;}
-@media(max-width:360px){.aircon-zapping-bar{gap:4px;padding-left:5px;padding-right:5px}.aircon-sleep-right{padding-left:5px}.aircon-zapping-label,.aircon-sleep-label{margin-right:4px;font-size:10px}.aircon-zapping-status,.aircon-sleep-select,.aircon-sleep-remaining{margin-right:5px}.aircon-zapping-status{min-width:38px;padding-left:5px;padding-right:5px}.aircon-zapping-button{min-width:40px;padding-left:5px;padding-right:5px} }
-@media(max-width:285px){.aircon-zapping-label,.aircon-sleep-label{display:none}.aircon-sleep-right{border-left:0;padding-left:0} }
-.aircon-empty{padding:16px;color:var(--aircon-muted);}
-""");
-    }
-
-
-    private static string BuildHostActionAttributes(
-        RuntimeUiRenderContext context,
-        IReadOnlyDictionary<string, string?> fields,
-        string eventName,
-        string responseMode,
-        string formCapture = "")
-    {
-        return context.BuildPluginActionAttributes(fields, eventName, responseMode, formCapture);
-    }
-
-    private static string BuildToolbar(RuntimeUiRenderContext context, IReadOnlyList<WaveFilterRow> waveFilters, IReadOnlyList<ViewerSessionRow> viewerSessions, ViewerProfileState viewerProfiles, ViewerOperation action, WindowOperation window, string filter, string selectedTuner, ViewerProfileChoice selectedViewerProfile, bool alwaysOnTop)
-    {
-        var filterForms = new List<string>();
-        foreach (var f in CanonicalWaveFilters(waveFilters))
-        {
-            filterForms.Add(BuildFilterForm(context, f.Group, f.Label, filter, selectedTuner, selectedViewerProfile, alwaysOnTop, viewerProfiles, action, window));
-        }
-
-        var refresh = BuildRefreshForm(window, filter, selectedViewerProfile.Value);
-        var selectedProfileSession = ResolveSelectedProfileSession(viewerSessions, selectedViewerProfile.Value);
-        var power = BuildToolbarStopForm(context, selectedProfileSession, action, window, filter, selectedViewerProfile.Value);
-        var pin = BuildPinForm(window, !alwaysOnTop, filter, selectedTuner, selectedViewerProfile.Value, alwaysOnTop);
-        var settings = BuildSettingsButton(context, action, window, filter, selectedViewerProfile.Value);
-
-        // The four-wave layout must not depend on CSS :has(), which is unsupported by the Host WebBrowser fallback.
-        // The actual client width may be smaller than the Host's 360px outer-window minimum.
-        var fourWaveClass = CanonicalWaveFilters(waveFilters).Any(x => x.Group.Equals("CATV", StringComparison.OrdinalIgnoreCase))
-            ? " aircon-wave-four" : string.Empty;
-        var waveGroup =
-            "<div class='aircon-toolbar-wave-area" + fourWaveClass + "' data-role='wave-selector-group'>" +
-            "<span class='aircon-toolbar-label'>放送波：</span>" +
-            "<span class='aircon-wave-group' role='group' aria-label='放送波'>" + string.Join("", filterForms) + "</span>" +
-            "</div>";
-
-        var viewerProfileGroup = BuildViewerProfileSelector(context, viewerProfiles, action, window, filter, selectedTuner, selectedViewerProfile.Value, alwaysOnTop);
-
-        var actionGroup =
-            "<div class='aircon-toolbar-actions' data-role='viewer-and-window-actions'>" +
-            refresh + power + pin + settings +
-            "</div>";
-
-        return "<div class='aircon-toolbar'><div class='aircon-toolbar-inner'>" + waveGroup + viewerProfileGroup + actionGroup + "</div></div>";
-    }
-
-
-    private static ViewerSessionRow? ResolveSelectedProfileSession(IReadOnlyList<ViewerSessionRow> sessions, string selectedViewerProfile)
-    {
-        if (sessions == null || sessions.Count == 0 || string.IsNullOrWhiteSpace(selectedViewerProfile)) return null;
-        return sessions
-            .Where(x => !string.IsNullOrWhiteSpace(x.LeaseId))
-            .Where(x => x.ViewerProfile.Equals(selectedViewerProfile, StringComparison.OrdinalIgnoreCase))
-            .OrderByDescending(x => x.IsActive)
-            .ThenByDescending(x => x.Current)
-            .FirstOrDefault();
-    }
-
-    private static string BuildViewerProfileSelector(RuntimeUiRenderContext context, ViewerProfileState state, ViewerOperation action, WindowOperation window, string filter, string selectedTuner, string selectedViewerProfile, bool alwaysOnTop)
-    {
-        if (!state.SelectorVisibleRecommended)
-        {
-            return "<div class='aircon-toolbar-profile-slot aircon-toolbar-profile-slot-reserved' data-role='viewer-profile-reserved'></div>";
-        }
-
-        var buttons = new List<string>();
-        // The displayed wave is the authority for Viewer Profile visibility.
-        // GR shows only GR profiles; BS and CS show only BSCS profiles.
-        var waveProfiles = state.AvailableForWave(filter).ToList();
-        foreach (var p in waveProfiles)
-        {
-            var active = p.Id.Equals(selectedViewerProfile, StringComparison.OrdinalIgnoreCase);
-            var groups = p.AvailableGroups == null || p.AvailableGroups.Count == 0 ? "ALL" : string.Join(",", p.AvailableGroups);
-            var displayLabel = ViewerProfileSegmentLabel(p, filter);
-            var sharedSuffix = p.IsShared ? "（共用）" : string.Empty;
-            var title = p.Name + sharedSuffix;
-            var cls = "aircon-toolbar-button aircon-profile-button" + (active ? " aircon-profile-button-on" : string.Empty);
-
-            var fields = BuildViewerActivateFields(action, window, filter, p.Id);
-            var attrs = BuildHostActionAttributes(context, fields, "click", "refreshWindow");
-            buttons.Add("<span class=\"aircon-profile-segment-form\" data-role=\"viewer-profile-selector\" data-viewer-profile=\"" + HtmlAttr(p.Id) + "\" data-groups=\"" + HtmlAttr(groups) + "\">" +
-                "<button class=\"" + cls + "\" type=\"button\" " + attrs + " data-role=\"viewer-profile-option\" data-viewer-profile=\"" + HtmlAttr(p.Id) + "\" aria-pressed=\"" + (active ? BoolTrue : BoolFalse) + "\" title=\"" + HtmlAttr(title) + "\">" + Html(displayLabel) + "</button></span>");
-        }
-
-        if (buttons.Count == 0)
-        {
-            buttons.Add("<button class=\"aircon-toolbar-button aircon-profile-button aircon-profile-button-disabled\" type=\"button\" disabled aria-disabled=\"true\" title=\"視聴先候補なし\">-</button>");
-        }
-
-        return "<div class='aircon-toolbar-profile-slot aircon-profile-form' data-role='viewer-profile-selector'" +
-            " data-tvair-current-viewer-profile='" + HtmlAttr(selectedViewerProfile) + "'" +
-            " data-tvair-profile-count='" + state.SelectableProfiles.Count.ToString(System.Globalization.CultureInfo.InvariantCulture) + "'>" +
-            "<span class='aircon-profile-label'>チューナー </span>" +
-            "<span class='aircon-profile-segments' role='group' aria-label='TVTest'>" + string.Join("", buttons) + "</span>" +
-            "</div>";
-    }
-
-    private static string ViewerProfileSegmentLabel(ViewerProfileChoice profile, string wave)
-    {
-        // User-visible identity follows the TvAIr settings virtual-slot identifier (Tn/Sn).
-        // ViewerProfileId remains the internal authority; physical tuner identity is never shown here.
-        var frame = profile.TvTestFrameIndex > 0
-            ? profile.TvTestFrameIndex.ToString(System.Globalization.CultureInfo.InvariantCulture)
-            : "?";
-        return (NormalizeWaveFilter(wave) == "GR" ? "T" : NormalizeWaveFilter(wave) == "CATV" ? "C" : "S") + frame;
-    }
-
-    private static IReadOnlyList<WaveFilterRow> CanonicalWaveFilters(IReadOnlyList<WaveFilterRow> source)
-    {
-        static string LabelFor(string group) => group.Equals("GR", StringComparison.OrdinalIgnoreCase) ? "地上波" : group.ToUpperInvariant();
-        var groups = new[] { "GR", "BS", "CS", "CATV" }
-            .Where(group => source.Any(x => NormalizeWaveFilter(x.Group) == group))
-            .ToList();
-        return groups.Select(group => new WaveFilterRow(group, group, LabelFor(group)))
-            .ToArray();
-    }
-
-    private static string BuildRows(RuntimeUiRenderContext context, IReadOnlyList<ServiceRow> services, IReadOnlyList<ViewerSessionRow> viewerSessions, ViewerOperation action, WindowOperation window, TunerChoice selectedTuner, ViewerProfileChoice selectedViewerProfile, string filter, bool zappingActive, string activeZappingWave, DateTimeOffset? powerOffDeadline)
-    {
-        if (services.Count == 0) return "<div class=\"aircon-empty\">表示対象の局がありません。</div>" + BuildZappingBar(context, false, viewerSessions, action, window, filter, selectedViewerProfile.Value, zappingActive, activeZappingWave, powerOffDeadline);
-        var parts = new List<string>();
-        if (!selectedViewerProfile.Enabled)
-            parts.Add("<div class=\"aircon-empty\">局一覧のみ表示しています。視聴には対応する視聴用チューナーの設定が必要です。</div>");
-        var rowIndex = 0;
-        var selectedSession = viewerSessions
-            .Where(x => x.IsActive && x.ViewerProfile.Equals(selectedViewerProfile.Value, StringComparison.OrdinalIgnoreCase))
-            .OrderByDescending(x => x.Current)
-            .FirstOrDefault();
-        foreach (var row in services)
-        {
-            // The active toolbar button already represents the selected wave.
-            // Do not render an additional GR/BS/CS section band inside the scroll area.
-            parts.Add(BuildServiceRow(context, row, action, window, selectedTuner, selectedViewerProfile, selectedSession, rowIndex++, zappingActive));
-        }
-        parts.Add(BuildZappingBar(context, true, viewerSessions, action, window, filter, selectedViewerProfile.Value, zappingActive, activeZappingWave, powerOffDeadline));
-        return string.Join("", parts);
-    }
-
-    private static string BuildZappingBar(RuntimeUiRenderContext context, bool enabled, IReadOnlyList<ViewerSessionRow> viewerSessions, ViewerOperation action, WindowOperation window, string filter, string selectedViewerProfile, bool active, string activeWave, DateTimeOffset? powerOffDeadline)
-    {
-        var canPost = enabled && !string.IsNullOrWhiteSpace(selectedViewerProfile)
-            && !string.IsNullOrWhiteSpace(action.ActionEndpoint)
-            && !string.IsNullOrWhiteSpace(action.ActionToken)
-            && !string.IsNullOrWhiteSpace(window.WindowId);
-        var disabled = canPost ? string.Empty : " disabled=\"disabled\" aria-disabled=\"true\"";
-        var statusText = active ? "巡回中（" + NormalizeWaveFilter(activeWave) + "）" : "停止中";
-        var buttonText = active ? "停止" : "開始";
-        var title = active ? "ザッピングを停止" : GetZappingIntervalSeconds().ToString(System.Globalization.CultureInfo.InvariantCulture) + "秒ごとに同じ放送波内で順送りします";
-        var buttonClass = active ? "aircon-zapping-button aircon-zapping-button-on" : "aircon-zapping-button";
-        var statusClass = active ? "aircon-zapping-status aircon-zapping-status-on" : "aircon-zapping-status aircon-zapping-status-off";
-        var operation = active ? AirConActionZappingStop : AirConActionZappingStart;
-
-        var fields = new Dictionary<string, string?>
-        {
-            ["operation"] = operation,
-            ["wave"] = filter,
-            ["viewerProfile"] = selectedViewerProfile,
-            ["refreshQuery"] = "wave=" + filter + "&viewerProfile=" + selectedViewerProfile,
-            ["clientVersion"] = ClientVersion
-        };
-
-        var selectedSleepSession = viewerSessions.FirstOrDefault(s => s.ViewerProfile.Equals(selectedViewerProfile, StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(s.LeaseId));
-        var sleepDisabled = selectedSleepSession == null ? " disabled=\"disabled\" aria-disabled=\"true\"" : string.Empty;
-        var powerActive = powerOffDeadline.HasValue && powerOffDeadline.Value > DateTimeOffset.Now;
-        var remainingHours = powerActive ? Math.Max(1, (int)Math.Ceiling((powerOffDeadline!.Value - DateTimeOffset.Now).TotalHours)) : 1;
-        var powerOperation = powerActive ? AirConActionPowerOffStop : AirConActionPowerOffStart;
-        var powerFields = new Dictionary<string, string?>(fields)
-        {
-            ["refreshQuery"] = "wave=" + filter + "&viewerProfile=" + selectedViewerProfile
-        };
-
-        return "<div id=\"aircon-zapping-bar\" class=\"aircon-zapping-bar\" data-aircon-zapping-wave=\"" + HtmlAttr(filter) + "\" data-aircon-zapping-profile=\"" + HtmlAttr(selectedViewerProfile) + "\" data-aircon-zapping-window=\"" + HtmlAttr(window.WindowId) + "\" data-aircon-zapping-active=\"" + (active ? BoolTrue : BoolFalse) + "\">"
-            + "<div class=\"aircon-zapping-left\">"
-            + "<span class=\"aircon-zapping-label\">ザッピング</span>"
-            + "<span id=\"aircon-zapping-status\" class=\"" + statusClass + "\">" + Html(statusText) + "</span>"
-            + "<button id=\"aircon-zapping-button\" class=\"" + buttonClass + "\" type=\"button\" " + BuildHostActionAttributes(context, new Dictionary<string, string?>(fields) { ["operation"] = operation, ["airconAction"] = operation }, "click", "patchWindow") + " title=\"" + HtmlAttr(title) + "\"" + disabled + ">" + Html(buttonText) + "</button></div>"
-            + "<form id=\"aircon-sleep-form\" class=\"aircon-sleep-right aircon-sleep-form\">"
-            + "<span id=\"aircon-sleep-label\" class=\"aircon-sleep-label\">" + (powerActive ? "終了まで" : "電源OFF") + "</span>"
-            + "<select id=\"aircon-sleep-select\" name=\"hours\" class=\"aircon-sleep-select\" aria-label=\"終了タイマー\" title=\"終了タイマー\"" + (powerActive ? " hidden=\"hidden\"" : string.Empty) + "><option value=\"1\">1h</option><option value=\"2\">2h</option><option value=\"3\">3h</option><option value=\"4\">4h</option><option value=\"5\">5h</option><option value=\"6\">6h</option></select>"
-            + "<span id=\"aircon-sleep-remaining\" class=\"aircon-sleep-remaining\"" + (powerActive ? string.Empty : " hidden=\"hidden\"") + ">" + remainingHours.ToString(System.Globalization.CultureInfo.InvariantCulture) + "h</span>"
-            + "<button id=\"aircon-sleep-button\" class=\"aircon-sleep-button" + (powerActive ? " aircon-sleep-button-on" : string.Empty) + "\" type=\"button\" " + BuildHostActionAttributes(context, new Dictionary<string, string?>(powerFields) { ["operation"] = powerOperation }, "click", "patchWindow", "closestForm") + " title=\"" + (powerActive ? "終了タイマーを停止" : "選択中TVTestの終了タイマーを開始") + "\"" + sleepDisabled + ">" + (powerActive ? "停止" : "開始") + "</button>"
-            + "</form></div>";
-    }
-
-    private static string BuildViewerReservationMenu(RuntimeUiRenderContext context, FloatingViewerData data, ViewerOperation action, WindowOperation window, string filter, string displayedViewerProfile)
-    {
-        var now = DateTimeOffset.Now;
-        var limit = now.AddHours(6);
-        var profiles = data.ViewerProfiles.AvailableForWave(filter).ToArray();
-        if (profiles.Length == 0) return "<div id=\"aircon-reservation-menu\" class=\"aircon-reservation-menu\"></div>";
-
-        var sections = new List<string>();
-        foreach (var service in data.Services.Where(HasResolvedTriplet))
-        {
-            var events = data.ProgramEvents
-                .Where(x => x.NetworkId == service.NetworkId && x.TransportStreamId == service.TransportStreamId && x.ServiceId == service.ServiceId)
-                .Where(x => x.Start > now && x.Start < limit && x.End > x.Start && x.EventNumber is >= 0 and <= ushort.MaxValue)
-                .OrderBy(x => x.Start)
-                .ToArray();
-            var items = new List<string>();
-            foreach (var program in events)
-            {
-                var buttons = new List<string>();
-                foreach (var profile in profiles)
-                {
-                    var existing = data.ViewerReservations.FirstOrDefault(x =>
-                        x.ViewerProfileId.Equals(profile.Value, StringComparison.OrdinalIgnoreCase) &&
-                        x.Service.NetworkId == service.NetworkId && x.Service.TransportStreamId == service.TransportStreamId && x.Service.ServiceId == service.ServiceId &&
-                        x.EventId == (ushort)program.EventNumber && x.State.Equals("Scheduled", StringComparison.OrdinalIgnoreCase));
-                    var conflict = existing == null && data.ViewerReservations.Any(x =>
-                        x.ViewerProfileId.Equals(profile.Value, StringComparison.OrdinalIgnoreCase) &&
-                        x.State.Equals("Scheduled", StringComparison.OrdinalIgnoreCase) &&
-                        x.ScheduledStart == program.Start);
-                    var label = ViewerProfileSegmentLabel(profile, filter);
-                    if (conflict)
-                    {
-                        buttons.Add("<button type=\"button\" class=\"aircon-reservation-target aircon-reservation-target-conflict\" disabled aria-disabled=\"true\" title=\"同時刻に別の視聴予約があります\">" + Html(label) + "</button>");
-                        continue;
-                    }
-                    var fields = new Dictionary<string, string?>
-                    {
-                        ["operation"] = AirConActionViewerReservationToggle,
-                        ["airconAction"] = AirConActionViewerReservationToggle,
-                        ["wave"] = filter,
-                        ["viewerProfile"] = profile.Value,
-                        ["returnViewerProfile"] = displayedViewerProfile,
-                        ["networkId"] = service.NetworkId.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                        ["transportStreamId"] = service.TransportStreamId.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                        ["serviceId"] = service.ServiceId.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                        ["eventId"] = program.EventNumber.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                        ["scheduledStart"] = program.Start.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
-                        ["scheduledEnd"] = program.End.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
-                        ["reservationId"] = existing?.ReservationId ?? string.Empty,
-                        ["refreshQuery"] = "wave=" + filter + "&viewerProfile=" + profile.Value,
-                        ["clientVersion"] = ClientVersion
-                    };
-                    var attrs = BuildHostActionAttributes(context, fields, "click", "refreshWindow");
-                    var cls = "aircon-reservation-target" + (existing != null ? " aircon-reservation-target-on" : string.Empty);
-                    var title = existing != null ? "解除" : "登録";
-                    buttons.Add("<button type=\"button\" class=\"" + cls + "\" " + attrs + " title=\"" + title + "\">" + Html(label) + "</button>");
-                }
-                items.Add("<div class=\"aircon-reservation-program\"><span class=\"aircon-reservation-time\">" + Html(program.Start.ToLocalTime().ToString("HH:mm", System.Globalization.CultureInfo.InvariantCulture)) + " - " + Html(program.End.ToLocalTime().ToString("HH:mm", System.Globalization.CultureInfo.InvariantCulture)) + "</span><span class=\"aircon-reservation-title\">" + Html(program.Title) + "</span><span class=\"aircon-reservation-targets\">" + string.Join("", buttons) + "</span></div>");
-            }
-            if (items.Count == 0) items.Add("<div class=\"aircon-reservation-empty\">6時間以内の番組がありません。</div>");
-            sections.Add("<div id=\"aircon-reservation-" + HtmlAttr(BuildServiceDomId(service)) + "\" class=\"aircon-reservation-section\">" + string.Join("", items) + "</div>");
-        }
-        return "<div id=\"aircon-reservation-menu\" class=\"aircon-reservation-menu\">" + string.Join("", sections) + "</div>";
-    }
-
-    private static string BuildServiceRow(RuntimeUiRenderContext context, ServiceRow row, ViewerOperation action, WindowOperation window, TunerChoice selectedTuner, ViewerProfileChoice selectedViewerProfile, ViewerSessionRow? selectedSession, int rowIndex, bool zappingActive)
-    {
-        var hasTriplet = HasResolvedTriplet(row);
-        var attrs = hasTriplet ? BuildFloatingViewerActionAttributes(row, action, window, selectedTuner, selectedViewerProfile, selectedSession) : string.Empty;
-        var parityClass = (rowIndex % 2 == 0) ? "aircon-row-even" : "aircon-row-odd";
-        var isSelectedProfileViewing = row.IsViewing && (string.IsNullOrWhiteSpace(row.ViewingViewerProfile) || row.ViewingViewerProfile.Equals(selectedViewerProfile.Value, StringComparison.OrdinalIgnoreCase));
-        var isOtherProfileViewing = row.IsViewing && !isSelectedProfileViewing;
-        var cls = isSelectedProfileViewing
-            ? (zappingActive ? "aircon-row aircon-row-zapping-selected" : "aircon-row aircon-row-viewing-selected")
-            : isOtherProfileViewing
-                ? "aircon-row aircon-row-viewing-other"
-                : hasTriplet ? "aircon-row " + parityClass : "aircon-row aircon-row-disabled";
-        var canView = hasTriplet && selectedViewerProfile.Enabled
-            && selectedViewerProfile.IsAvailableForWave(row.ProgramGuideFilterGroup);
-        var title = !selectedViewerProfile.Enabled ? "対応する視聴用チューナーが設定されていません" : hasTriplet ? "ダブルクリックで視聴 / 右クリックで視聴予約" : "このチャンネルは現在視聴できません";
-        var current = string.IsNullOrWhiteSpace(row.CurrentTitle) ? "番組情報取得中" : row.CurrentTitle;
-        var currentClass = "aircon-current";
-        var currentTitleAttr = " title=\"\" aria-label=\"" + HtmlAttr(current) + "\" data-aircon-marquee=\"true\"";
-        var serviceDomId = hasTriplet ? BuildServiceDomId(row) : string.Empty;
-        var rowId = hasTriplet
-            ? " id=\"" + HtmlAttr(isSelectedProfileViewing ? CurrentViewingAnchorId : serviceDomId) + "\""
-            : string.Empty;
-        var serviceDataId = hasTriplet ? " data-aircon-service-id=\"" + HtmlAttr(serviceDomId) + "\" data-aircon-zapping-row=\"true\" data-aircon-zapping-index=\"" + rowIndex.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\"" : string.Empty;
-        var content =
-            $"<span class=\"aircon-service\">{Html(row.ServiceName)}</span>" +
-            BuildCurrentTimeHtml(row) +
-            $"<span class=\"{currentClass}\"{currentTitleAttr}><span class=\"aircon-current-track\"><span class=\"aircon-current-text\">{Html(current)}</span><span class=\"aircon-current-copy\" aria-hidden=\"true\">{Html(current)}</span></span></span>";
-
-        if (!canView)
-        {
-            return $"<div class=\"{cls}\" title=\"{HtmlAttr(title)}\">" + content + "</div>";
-        }
-
-        var tuneFields = BuildViewerTuneFields(row, action, window, selectedTuner, selectedViewerProfile, selectedSession);
-        var hostAttrs = BuildHostActionAttributes(context, tuneFields, "dblclick", "refreshWindow");
-        return $"<div{rowId}{serviceDataId} class=\"{cls}\" title=\"{HtmlAttr(title)}\" {hostAttrs} data-aircon-viewer-tune=\"true\">" + content + "</div>";
-    }
-
-    private static Dictionary<string, string?> BuildViewerTuneFields(ServiceRow row, ViewerOperation action, WindowOperation window, TunerChoice selectedTuner, ViewerProfileChoice selectedViewerProfile, ViewerSessionRow? selectedSession)
-    {
-        var payload = BuildViewerStartPayload(row, selectedTuner, selectedViewerProfile);
-        var fields = new Dictionary<string, string?>
-        {
-            ["operation"] = AirConActionViewerTune,
-            ["wave"] = payload.BroadcastGroup,
-            ["viewerProfile"] = payload.ViewerProfile,
-            ["networkId"] = payload.NetworkId,
-            ["transportStreamId"] = payload.TransportStreamId,
-            ["serviceId"] = payload.ServiceId,
-            ["channelSpace"] = payload.ChannelSpace,
-            ["channelIndex"] = payload.ChannelIndex,
-            ["channelArgument"] = payload.ChannelArgument,
-            ["viewerProfileName"] = payload.ViewerProfileName,
-            ["refreshQuery"] = BuildViewerRefreshQuery(row, selectedViewerProfile.Value),
-            ["clientVersion"] = ClientVersion
-        };
-        AppendViewerSessionContractFields(fields, selectedSession == null ? null : new ViewerSessionContractState(selectedSession.ViewerSessionId, selectedSession.Generation));
-        if (!selectedTuner.IsAuto)
-        {
-            fields["preferredTunerName"] = selectedTuner.Name;
-            fields["preferredDid"] = selectedTuner.Did;
-            fields["preferredSlot"] = selectedTuner.SlotIndex.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        }
-        return fields;
-    }
-
-    private static string BuildCurrentTimeHtml(ServiceRow row)
-    {
-        var start = FormatTime(row.CurrentStart);
-        var end = FormatTime(row.CurrentEnd);
-        var title = string.IsNullOrEmpty(start) && string.IsNullOrEmpty(end)
-            ? string.Empty
-            : " title=\"" + HtmlAttr((start.Length > 0 ? start : "--:--") + " - " + (end.Length > 0 ? end : "--:--")) + "\"";
-        return "<span class=\"aircon-time\"" + title + ">"
-            + "<span class=\"aircon-time-start\">" + Html(start) + "</span>"
-            + "<span class=\"aircon-time-end\">" + Html(end) + "</span>"
-            + "</span>";
-    }
-
-    private static string FormatTime(DateTimeOffset? value)
-        => value.HasValue ? value.Value.ToLocalTime().ToString("HH:mm", System.Globalization.CultureInfo.InvariantCulture) : string.Empty;
-
-    private static int CalculateServiceColumnWidth(IReadOnlyList<ServiceRow> services)
-    {
-        var maxTextWidth = 0;
-        foreach (var service in services)
-        {
-            var name = service.ServiceName ?? string.Empty;
-            maxTextWidth = Math.Max(maxTextWidth, EstimateServiceNameWidthPx(name));
-        }
-
-        var width = maxTextWidth + ToolWindowServiceColumnHorizontalReservePx;
-        return Math.Max(ToolWindowServiceColumnMinimumWidthPx, Math.Min(ToolWindowServiceColumnMaximumWidthPx, width));
-    }
-
-    private static int EstimateServiceNameWidthPx(string text)
-    {
-        var width = 0;
-        foreach (var ch in text)
-        {
-            width += IsNarrowDisplayChar(ch) ? 7 : 12;
-        }
-        return width;
-    }
-
-    private static bool IsNarrowDisplayChar(char ch)
-        => (ch >= '\u0020' && ch <= '\u007e') || (ch >= '\uff61' && ch <= '\uff9f');
-
-    private static string BuildServiceDomId(ServiceRow row)
-        => "svc-" + row.NetworkId.ToString(System.Globalization.CultureInfo.InvariantCulture)
-            + "-" + row.TransportStreamId.ToString(System.Globalization.CultureInfo.InvariantCulture)
-            + "-" + row.ServiceId.ToString(System.Globalization.CultureInfo.InvariantCulture);
-
-    private static bool HasResolvedTriplet(ServiceRow row)
-        => row.NetworkId > 0 && row.TransportStreamId > 0 && row.ServiceId > 0;
-
-    // ContentRoute is a Plugin navigation path, never a bare query string.
-    // Keep the existing route when the Viewer Profile is intentionally absent
-    // (e.g. a wave without a configured viewer).
-    private static string BuildViewerContentRoute(string wave, string? viewerProfile)
-    {
-        var route = "/plugin/aircon?wave=" + Url(wave);
-        return string.IsNullOrWhiteSpace(viewerProfile)
-            ? route
-            : route + "&viewerProfile=" + Url(viewerProfile);
-    }
-
-    private static string Url(string value) => WebUtility.UrlEncode(value);
-
-    private static string BuildViewerRefreshQuery(ServiceRow row, string selectedViewerProfile)
-    {
-        var wave = string.IsNullOrWhiteSpace(row.ProgramGuideFilterGroup) ? "GR" : row.ProgramGuideFilterGroup;
-        return "wave=" + Url(wave)
-            + "&viewerProfile=" + Url(selectedViewerProfile);
-    }
-
-    private static string BuildFloatingViewerActionAttributes(ServiceRow row, ViewerOperation action, WindowOperation window, TunerChoice selectedTuner, ViewerProfileChoice selectedViewerProfile, ViewerSessionRow? selectedSession)
-    {
-        if (!action.CanPost || string.IsNullOrWhiteSpace(window.WindowId) || !HasResolvedTriplet(row)) return string.Empty;
-        var payload = BuildViewerStartPayload(row, selectedTuner, selectedViewerProfile);
-        var fields = new Dictionary<string, string?>
-        {
-            ["safe-event"] = "true",
-            ["event"] = "dblclick",
-            ["action"] = ActionPluginOwned,
-            ["plugin-id"] = action.PluginId,
-            ["route-segment"] = action.RouteSegment,
-            ["token"] = action.ActionToken,
-            ["method"] = action.ActionMethod,
-            ["endpoint"] = action.ActionEndpoint,
-            ["response-mode"] = ResponseModeHostHandled,
-            ["refresh-target"] = RefreshTargetContent,
-            ["refresh-after"] = BoolTrue,
-            ["refresh-query"] = BuildViewerRefreshQuery(row, selectedViewerProfile.Value),
-            ["window-id"] = window.WindowId,
-            ["payload-networkId"] = payload.NetworkId,
-            ["payload-transportStreamId"] = payload.TransportStreamId,
-            ["payload-serviceId"] = payload.ServiceId,
-            ["payload-channelSpace"] = payload.ChannelSpace,
-            ["payload-channelIndex"] = payload.ChannelIndex,
-            ["payload-channelArgument"] = payload.ChannelArgument,
-            ["payload-broadcastGroup"] = payload.BroadcastGroup,
-            ["payload-viewerProfileName"] = payload.ViewerProfileName,
-            ["payload-airconAction"] = AirConActionViewerTune,
-            ["payload-wave"] = payload.BroadcastGroup,
-            ["payload-windowId"] = window.WindowId
-        };
-        AppendViewerSessionContractFields(fields, selectedSession == null ? null : new ViewerSessionContractState(selectedSession.ViewerSessionId, selectedSession.Generation));
-        if (!selectedTuner.IsAuto)
-        {
-            fields["payload-preferredTunerName"] = selectedTuner.Name;
-            fields["payload-preferredDid"] = selectedTuner.Did;
-            fields["payload-preferredSlot"] = selectedTuner.SlotIndex.ToString();
-        }
-        return "role=\"button\" tabindex=\"0\" " +
-            string.Join(" ", fields.Select(kv => $"data-tvair-{HtmlAttr(kv.Key)}=\"{HtmlAttr(kv.Value ?? string.Empty)}\""));
-    }
-
-    private static ViewerStartPayload BuildViewerStartPayload(ServiceRow row, TunerChoice selectedTuner, ViewerProfileChoice selectedViewerProfile)
-    {
-        return new ViewerStartPayload(
-            row.NetworkId.ToString(),
-            row.TransportStreamId.ToString(),
-            row.ServiceId.ToString(),
-            row.ChannelSpace.ToString(),
-            row.ChannelIndex.ToString(),
-            row.ChannelArgument ?? string.Empty,
-            row.ProgramGuideFilterGroup ?? string.Empty,
-            row.ProgramGuideFilterGroup ?? string.Empty,
-            row.AllocationGroup ?? string.Empty,
-            row.TunerGroup ?? string.Empty,
-            row.ServiceName ?? string.Empty,
-            selectedTuner.IsAuto ? string.Empty : selectedTuner.Name,
-            selectedTuner.IsAuto ? string.Empty : selectedTuner.Did,
-            selectedTuner.IsAuto ? string.Empty : selectedTuner.SlotIndex.ToString(),
-            selectedViewerProfile.Value,
-            selectedViewerProfile.Name);
-    }
-
-    private static string BuildPinForm(WindowOperation window, bool next, string filter, string selectedTuner, string selectedViewerProfile, bool current)
-    {
-        if (string.IsNullOrWhiteSpace(window.WindowEndpoint) || string.IsNullOrWhiteSpace(window.WindowId))
-        {
-            return "<span class=\"aircon-action-form\" data-role=\"toolbar-action-slot\"><button class=\"aircon-toolbar-button aircon-action-button aircon-action-topmost aircon-toolbar-button-disabled\" type=\"button\" aria-disabled=\"true\" aria-label=\"前面固定\" title=\"AIrConを常に前面\">⚑</button></span>";
-        }
-        var fields = new Dictionary<string, string?>
-        {
-            ["pluginId"] = window.PluginId,
-            ["plugin-id"] = window.PluginId,
-            ["routeSegment"] = window.RouteSegment,
-            ["route-segment"] = window.RouteSegment,
-            ["action"] = ActionUpdateWindow,
-            ["token"] = window.WindowToken,
-            ["windowId"] = window.WindowId,
-            ["window-id"] = window.WindowId,
-            ["currentWindowId"] = window.WindowId,
-            ["alwaysOnTop"] = next ? BoolTrue : BoolFalse,
-            ["payload-alwaysOnTop"] = next ? BoolTrue : BoolFalse,
-            ["responseMode"] = ResponseModeHostHandled,
-            ["response-mode"] = ResponseModeHostHandled,
-            ["refreshAfter"] = BoolTrue,
-            ["refresh-after"] = BoolTrue,
-            ["target"] = RefreshTargetContent,
-            ["refreshTarget"] = RefreshTargetContent,
-            ["refresh-target"] = RefreshTargetContent,
-            ["preserveScroll"] = BoolTrue,
-            ["wave"] = filter,
-            ["currentWave"] = filter,
-            ["viewerProfile"] = selectedViewerProfile,
-            ["viewer-profile"] = selectedViewerProfile,
-            ["refreshQuery"] = "wave=" + filter + "&viewerProfile=" + selectedViewerProfile,
-            ["forceReload"] = BoolFalse,
-            ["clientVersion"] = ClientVersion
-        };
-        var cls = current ? "aircon-toolbar-button aircon-action-button aircon-action-topmost aircon-action-topmost-on" : "aircon-toolbar-button aircon-action-button aircon-action-topmost";
-        var title = current ? "常に前面を解除" : "常に前面に固定";
-        return "<form class=\"aircon-action-form\" method=\"" + HtmlAttr(window.WindowMethod) + "\" action=\"" + HtmlAttr(window.WindowEndpoint) + "\">" +
-            HiddenInputs(fields) +
-            "<button class=\"" + cls + "\" type=\"submit\" aria-pressed=\"" + (current ? BoolTrue : BoolFalse) + "\" aria-label=\"前面固定\" title=\"" + HtmlAttr(title) + "\">⚑</button></form>";
-    }
-
-    private static Dictionary<string, string?> BuildViewerStopFields(ViewerSessionRow session, ViewerOperation action, WindowOperation window, string filter, string viewerProfile)
-    {
-        var clientId = window.PluginId + ":viewer:" + viewerProfile;
-        var fields = new Dictionary<string, string?>
-        {
-            ["pluginId"] = action.PluginId,
-            ["plugin-id"] = action.PluginId,
-            ["routeSegment"] = action.RouteSegment,
-            ["route-segment"] = action.RouteSegment,
-            ["clientId"] = clientId,
-            ["client-id"] = clientId,
-            ["viewerClientId"] = clientId,
-            ["viewer-client-id"] = clientId,
-            ["event"] = "click",
-            ["safeEvent"] = BoolTrue,
-            ["safe-event"] = BoolTrue,
-            ["action"] = ActionViewerStop,
-            ["safeEventAction"] = ActionViewerStop,
-            ["safe-event-action"] = ActionViewerStop,
-            ["token"] = action.ActionToken,
-            ["actionToken"] = action.ActionToken,
-            ["action-token"] = action.ActionToken,
-            ["leaseId"] = session.LeaseId,
-            ["lease-id"] = session.LeaseId,
-            ["payload-leaseId"] = session.LeaseId,
-            ["payload-lease-id"] = session.LeaseId,
-            ["responseMode"] = ResponseModeHostHandled,
-            ["response-mode"] = ResponseModeHostHandled,
-            ["windowId"] = window.WindowId,
-            ["window-id"] = window.WindowId,
-            ["currentWindowId"] = window.WindowId,
-            ["current-window-id"] = window.WindowId,
-            ["preserveScroll"] = BoolTrue,
-            ["preserve-scroll"] = BoolTrue,
-            ["wave"] = filter,
-            ["currentWave"] = filter,
-            ["viewerProfile"] = viewerProfile,
-            ["refreshQuery"] = "wave=" + filter + "&viewerProfile=" + viewerProfile,
-            ["contentRoute"] = "/plugin/aircon?wave=" + filter + "&viewerProfile=" + viewerProfile,
-            ["clientVersion"] = ClientVersion
-        };
-        AppendViewerSessionContractFields(fields, new ViewerSessionContractState(session.ViewerSessionId, session.Generation));
-        return fields;
-    }
-
-    private static string BuildToolbarStopForm(RuntimeUiRenderContext context, ViewerSessionRow? session, ViewerOperation action, WindowOperation window, string filter, string selectedViewerProfile)
-    {
-        if (string.IsNullOrWhiteSpace(action.ActionEndpoint)
-            || string.IsNullOrWhiteSpace(action.ActionToken)
-            || string.IsNullOrWhiteSpace(window.WindowId))
-        {
-            return "<span class=\"aircon-action-form\" data-role=\"toolbar-action-slot\"><button id=\"aircon-viewer-power-button\" class=\"aircon-toolbar-button aircon-action-button aircon-action-power aircon-toolbar-button-disabled\" type=\"button\" aria-disabled=\"true\" aria-label=\"視聴停止\" title=\"現在は視聴を停止できません\">⏻</button></span>";
-        }
-
-        if (session == null || string.IsNullOrWhiteSpace(session.LeaseId) || !session.ViewerProfile.Equals(selectedViewerProfile, StringComparison.OrdinalIgnoreCase))
-        {
-            var disabledTitle = string.IsNullOrWhiteSpace(selectedViewerProfile)
-                ? "停止する視聴がありません"
-                : "選択中のTVTestは停止済みです";
-            return "<span class=\"aircon-action-form\" data-role=\"toolbar-action-slot\"><button id=\"aircon-viewer-power-button\" class=\"aircon-toolbar-button aircon-action-button aircon-action-power aircon-toolbar-button-disabled\" type=\"button\" aria-disabled=\"true\" aria-label=\"視聴停止\" title=\"" + HtmlAttr(disabledTitle) + "\">⏻</button></span>";
-        }
-
-        var fields = new Dictionary<string, string?>
-        {
-            ["pluginId"] = action.PluginId,
-            ["plugin-id"] = action.PluginId,
-            ["routeSegment"] = action.RouteSegment,
-            ["route-segment"] = action.RouteSegment,
-            ["action"] = ActionPluginOwned,
-            ["safeEventAction"] = ActionPluginOwned,
-            ["safe-event-action"] = ActionPluginOwned,
-            ["token"] = action.ActionToken,
-            ["actionToken"] = action.ActionToken,
-            ["action-token"] = action.ActionToken,
-            ["responseMode"] = "refreshWindow",
-            ["response-mode"] = "refreshWindow",
-            ["windowId"] = window.WindowId,
-            ["window-id"] = window.WindowId,
-            ["currentWindowId"] = window.WindowId,
-            ["current-window-id"] = window.WindowId,
-            ["refreshTarget"] = RefreshTargetContent,
-            ["refresh-target"] = RefreshTargetContent,
-            ["wave"] = filter,
-            ["viewerProfile"] = selectedViewerProfile,
-            ["viewer-profile"] = selectedViewerProfile,
-            ["clientVersion"] = ClientVersion
-        };
-        fields["operation"] = AirConActionViewerPowerOff;
-        fields["airconAction"] = AirConActionViewerPowerOff;
-        var attrs = BuildHostActionAttributes(context, fields, "click", "refreshWindow");
-        return "<button id=\"aircon-viewer-power-button\" class=\"aircon-toolbar-button aircon-action-button aircon-action-power\" type=\"button\" " + attrs + " aria-label=\"視聴停止\" title=\"ザッピングを停止してAIrCon管理の現在の視聴TVTestを閉じる\">⏻</button>";
-    }
-
-    private static string BuildOpenWindowForm(WindowOperation window, bool alwaysOnTop, string filter, string selectedTuner, string selectedViewerProfile)
-    {
-        if (!window.CanOpen) return "<span>AIrConを開けません。</span>";
-        var fields = WindowOpenFields(window, alwaysOnTop, filter, selectedTuner, selectedViewerProfile);
-        return "<form method=\"" + HtmlAttr(window.WindowMethod) + "\" action=\"" + HtmlAttr(window.WindowEndpoint) + "\">" +
-            HiddenInputs(fields) +
-            "<button class=\"aircon-open\" type=\"submit\">AIrCon</button></form>";
-    }
-
-    private static Dictionary<string, string?> WindowOpenFields(WindowOperation window, bool alwaysOnTop, string filter, string selectedTuner, string selectedViewerProfile)
-    {
-        return new Dictionary<string, string?>
-        {
-            ["pluginId"] = window.PluginId,
-            ["routeSegment"] = window.RouteSegment,
-            ["action"] = "openWindow",
-            ["token"] = window.WindowToken,
-            ["responseMode"] = window.ToolWindowSupported ? "redirectBack" : "redirect",
-            ["title"] = PluginToolWindowTitle,
-            ["width"] = ToolWindowDefaultWidthPx.ToString(),
-            ["height"] = ToolWindowDefaultHeightPx.ToString(),
-            ["minWidth"] = ToolWindowMinimumWidthPx.ToString(),
-            ["minHeight"] = ToolWindowMinimumHeightPx.ToString(),
-            ["resizable"] = "true",
-            ["movable"] = "true",
-            ["alwaysOnTop"] = alwaysOnTop ? BoolTrue : BoolFalse,
-            ["hostManaged"] = "true",
-            ["toolWindowContentOnly"] = "true",
-            ["reuseExisting"] = "true",
-            ["activateExisting"] = "true",
-            ["target"] = RefreshTargetContent,
-            ["refreshTarget"] = RefreshTargetContent,
-            ["preserveScroll"] = BoolTrue,
-            // returnUrl は通常ブラウザ側へ戻るURL。ToolWindow内部フラグを絶対に混ぜない。
-            ["returnUrl"] = "/plugin/aircon",
-            ["wave"] = filter,
-            ["currentWave"] = filter,
-            ["viewerProfile"] = selectedViewerProfile,
-            ["viewer-profile"] = selectedViewerProfile,
-            ["refreshQuery"] = "wave=" + filter + "&viewerProfile=" + selectedViewerProfile,
-            ["clientVersion"] = ClientVersion
-        };
-    }
-
-    private static string BuildSettingsButton(RuntimeUiRenderContext context, ViewerOperation action, WindowOperation window, string filter, string selectedViewerProfile)
-    {
-        if (string.IsNullOrWhiteSpace(action.ActionToken) || string.IsNullOrWhiteSpace(window.WindowId))
-            return "<span class=\"aircon-action-form\" data-role=\"toolbar-action-slot\"><button class=\"aircon-toolbar-button aircon-action-button aircon-toolbar-button-disabled\" type=\"button\" aria-disabled=\"true\" aria-label=\"設定\" title=\"現在は設定を開けません\">⚙</button></span>";
-        var fields = new Dictionary<string, string?>
-        {
-            ["operation"] = AirConActionSettingsOpen,
-            ["windowId"] = window.WindowId,
-            ["wave"] = filter,
-            ["viewerProfile"] = selectedViewerProfile,
-            ["clientVersion"] = ClientVersion
-        };
-        var attrs = BuildHostActionAttributes(context, fields, "click", "hostHandled");
-        return "<span class=\"aircon-action-form\" data-role=\"toolbar-action-slot\"><button class=\"aircon-toolbar-button aircon-action-button aircon-action-settings\" type=\"button\" " + attrs + " aria-label=\"設定\" title=\"AIrCon設定\">⚙</button></span>";
-    }
-
-    private static string BuildSettingsHtml(RuntimeUiRenderContext context, ViewerOperation action, WindowOperation window, AirConSettings settings, string returnWave, string returnViewerProfile)
-    {
-        var saveFields = new Dictionary<string, string?>
-        {
-            ["operation"] = AirConActionSettingsSave,
-            ["windowId"] = window.WindowId,
-            ["returnWave"] = returnWave,
-            ["returnViewerProfile"] = returnViewerProfile,
-            ["clientVersion"] = ClientVersion
-        };
-        var closeFields = new Dictionary<string, string?>
-        {
-            ["operation"] = AirConActionSettingsClose,
-            ["windowId"] = window.WindowId,
-            ["returnWave"] = returnWave,
-            ["returnViewerProfile"] = returnViewerProfile,
-            ["clientVersion"] = ClientVersion
-        };
-        var saveAttrs = BuildHostActionAttributes(context, saveFields, "click", "hostHandled", "closestForm");
-        var closeAttrs = BuildHostActionAttributes(context, closeFields, "click", "hostHandled");
-        var checkedAttr = settings.RememberWindowPlacement ? " checked" : string.Empty;
-        string Selected(int value) => settings.ZappingIntervalSeconds == value ? " selected" : string.Empty;
-        string WaveSelected(string value) => settings.StartupWave.Equals(value, StringComparison.OrdinalIgnoreCase) ? " selected" : string.Empty;
-        var css = ResolveThemePalette(context).Apply(@"html,body{margin:0;width:100%;height:100%;background:var(--aircon-page);color:var(--aircon-text);font-family:Meiryo,'Yu Gothic',Arial,sans-serif;font-size:12px;overflow:hidden}.aircon-runtime-root,.aircon-runtime-root *{box-sizing:border-box}.aircon-settings{height:100%;padding:14px;background:var(--aircon-page)}.aircon-settings-title{font-size:14px;font-weight:bold;margin:0 0 14px}.aircon-settings-row{display:table;width:100%;margin:0 0 12px}.aircon-settings-label{display:table-cell;width:62%;vertical-align:middle}.aircon-settings-control{display:table-cell;text-align:right;vertical-align:middle}.aircon-settings select{width:118px;height:26px;border:1px solid var(--aircon-control-border);background:var(--aircon-input);color:var(--aircon-control-text);font-family:inherit}.aircon-toggle{width:18px;height:18px;vertical-align:middle}.aircon-settings-actions{text-align:right;margin-top:18px}.aircon-settings-button{min-width:64px;height:28px;margin-left:8px;border:1px solid var(--aircon-button-border);border-radius:3px;background:var(--aircon-button-bg);color:var(--aircon-button-text);font-family:inherit;font-weight:bold;cursor:pointer}.aircon-settings-button:hover{background:var(--aircon-button-hover)}");
-        return "<!doctype html><html><head><meta charset=\"utf-8\"><style>" + css + "</style></head><body><div class=\"aircon-settings\"><div class=\"aircon-settings-title\">AIrCon設定</div><form><div class=\"aircon-settings-row\"><div class=\"aircon-settings-label\">ウィンドウ位置とサイズを記憶する</div><div class=\"aircon-settings-control\"><input class=\"aircon-toggle\" type=\"checkbox\" name=\"rememberWindowPlacement\" value=\"true\"" + checkedAttr + "></div></div><div class=\"aircon-settings-row\"><div class=\"aircon-settings-label\">ザッピング間隔</div><div class=\"aircon-settings-control\"><select name=\"zappingIntervalSeconds\"><option value=\"30\"" + Selected(30) + ">30秒</option><option value=\"60\"" + Selected(60) + ">60秒</option><option value=\"90\"" + Selected(90) + ">90秒</option><option value=\"120\"" + Selected(120) + ">120秒</option><option value=\"180\"" + Selected(180) + ">180秒</option></select></div></div><div class=\"aircon-settings-row\"><div class=\"aircon-settings-label\">起動時に表示する放送波</div><div class=\"aircon-settings-control\"><select name=\"startupWave\"><option value=\"GR\"" + WaveSelected("GR") + ">GR</option><option value=\"BS\"" + WaveSelected("BS") + ">BS</option><option value=\"CS\"" + WaveSelected("CS") + ">CS</option><option value=\"CATV\"" + WaveSelected("CATV") + ">CATV</option></select></div></div><div class=\"aircon-settings-actions\"><button class=\"aircon-settings-button\" type=\"button\" " + closeAttrs + ">戻る</button><button class=\"aircon-settings-button\" type=\"button\" " + saveAttrs + ">保存</button></div></form></div></body></html>";
-    }
-
-    private static string BuildRefreshForm(WindowOperation window, string filter, string selectedViewerProfile)
-    {
-        if (!window.CanSelfRefresh) return string.Empty;
-        var fields = new Dictionary<string, string?>
-        {
-            ["pluginId"] = window.PluginId,
-            ["routeSegment"] = window.RouteSegment,
-            ["action"] = "refreshWindow",
-            ["token"] = window.WindowToken,
-            ["windowId"] = window.WindowId,
-            ["currentWindowId"] = window.WindowId,
-            ["target"] = RefreshTargetContent,
-            ["refreshTarget"] = RefreshTargetContent,
-            ["preserveScroll"] = BoolTrue,
-            ["responseMode"] = ResponseModeHostHandled,
-            ["response-mode"] = ResponseModeHostHandled,
-            ["refresh-target"] = RefreshTargetContent,
-            ["wave"] = filter,
-            ["currentWave"] = filter,
-            ["viewerProfile"] = selectedViewerProfile,
-            ["viewer-profile"] = selectedViewerProfile,
-            ["refreshQuery"] = "wave=" + filter + "&viewerProfile=" + selectedViewerProfile,
-            ["clientVersion"] = ClientVersion
-        };
-        return "<form class=\"aircon-action-form\" method=\"" + HtmlAttr(window.WindowMethod) + "\" action=\"" + HtmlAttr(window.WindowEndpoint) + "\" data-role=\"content-refresh\" data-action=\"refreshWindow\">" + HiddenInputs(fields) + "<button class=\"aircon-toolbar-button aircon-action-button aircon-action-refresh\" type=\"submit\" data-role=\"content-refresh\" data-action=\"refreshWindow\" aria-label=\"更新\" title=\"一覧を更新\">↻</button></form>";
-    }
-    private static string HiddenInputs(Dictionary<string, string?> fields)
-        => string.Join("", fields.Select(kv => $"<input type=\"hidden\" name=\"{HtmlAttr(kv.Key)}\" value=\"{HtmlAttr(kv.Value ?? string.Empty)}\">"));
-
-    private static string BuildFilterForm(RuntimeUiRenderContext context, string group, string label, string current, string selectedTuner, ViewerProfileChoice selectedViewerProfile, bool top, ViewerProfileState profiles, ViewerOperation action, WindowOperation window)
-    {
-        var isCurrent = group.Equals(current, StringComparison.OrdinalIgnoreCase);
-        var cls = isCurrent ? "aircon-toolbar-button aircon-wave-button aircon-wave-button-on" : "aircon-toolbar-button aircon-wave-button";
-        var targetProfile = profiles.AvailableForWave(group)
-            .FirstOrDefault(x => x.Id.Equals(selectedViewerProfile.Value, StringComparison.OrdinalIgnoreCase))
-            ?? profiles.AvailableForWave(group).FirstOrDefault();
-        var fields = new Dictionary<string, string?>
-        {
-            ["operation"] = targetProfile == null ? AirConActionBrowseWave : AirConActionViewerActivate,
-            ["wave"] = group,
-            ["viewerProfile"] = targetProfile?.Id ?? string.Empty,
-            ["waveButton"] = "true",
-            ["refreshQuery"] = "wave=" + group + "&viewerProfile=" + (targetProfile?.Id ?? string.Empty),
-            ["clientVersion"] = ClientVersion
-        };
-        // IMPORTANT regression guard: wave buttons deliberately combine wave browsing and focus.
-        // Reuse the existing viewerActivate path when a compatible profile exists; it activates
-        // ONLY an already-running TVTest, and refreshes the wave list BEFORE requesting focus.
-        // With no viewer profile (notably CATV), browseWave must still permit list-only browsing.
-        // This focus behavior predates CATV support and was accidentally removed in v1.0.6.
-        // Never remove it as a UI cleanup, and never start TVTest or retune merely on wave click.
-        // AIrCon owns row positioning inside its own HTML after render.
-        var attrs = BuildHostActionAttributes(context, fields, "click", "hostHandled");
-        return "<span class=\"aircon-nav-form\" data-role=\"wave-selector\" data-wave=\"" + HtmlAttr(group) + "\">" +
-            $"<button class=\"{cls}\" type=\"button\" {attrs} data-role=\"wave-selector\" data-wave=\"{HtmlAttr(group)}\" aria-pressed=\"{(isCurrent ? "true" : "false")}\" title=\"{HtmlAttr("放送波: " + label)}\">{Html(label)}</button></span>";
-    }
-
-    private static Dictionary<string, string?> BuildViewerActivateFields(ViewerOperation action, WindowOperation window, string wave, string viewerProfile)
-    {
-        return new Dictionary<string, string?>
-        {
-            ["operation"] = AirConActionViewerActivate,
-            ["wave"] = wave,
-            ["viewerProfile"] = viewerProfile,
-            ["refreshQuery"] = "wave=" + wave + "&viewerProfile=" + viewerProfile,
-            ["clientVersion"] = ClientVersion
-        };
-    }
-
-    private static Dictionary<string, string?> ToolContentFields(string filter, string tuner, string selectedViewerProfile, bool top, WindowOperation window)
-    {
-        var fields = new Dictionary<string, string?>
-        {
-            ["wave"] = filter,
-            ["viewerProfile"] = selectedViewerProfile,
-            ["viewer-profile"] = selectedViewerProfile,
-            ["__tvairHostWindow"] = "1",
-            ["__tvairToolHostContent"] = "1"
-        };
-        if (!string.IsNullOrWhiteSpace(window.WindowId)) fields["__tvairWindowId"] = window.WindowId;
-        return fields;
-    }
-
-    private static IReadOnlyList<TunerChoice> BuildTunerChoices(IReadOnlyList<ViewerTunerRow> tuners, string filter)
-    {
-        var list = new List<TunerChoice> { TunerChoice.Auto };
-        foreach (var t in tuners.Where(x => x.IsSelectableForViewer).OrderBy(x => x.SlotIndex))
-        {
-            if (filter == "GR" && !t.ProgramGuideFilterGroup.Equals("GR", StringComparison.OrdinalIgnoreCase)) continue;
-            if ((filter == "BS" || filter == "CS") && (t.ProgramGuideFilterGroup.Equals("GR", StringComparison.OrdinalIgnoreCase) || t.ProgramGuideFilterGroup.Equals("CATV", StringComparison.OrdinalIgnoreCase))) continue;
-            if (filter == "CATV" && !t.ProgramGuideFilterGroup.Equals("CATV", StringComparison.OrdinalIgnoreCase)) continue;
-            var value = t.Name + "|" + t.Did + "|" + t.SlotIndex;
-            list.Add(new TunerChoice(value, t.Name, t.Did, t.SlotIndex, t.Name, false));
-        }
-        return list;
-    }
-
-    private static TunerChoice ResolveSelectedTuner(IReadOnlyList<TunerChoice> choices, string value)
-        => choices.FirstOrDefault(x => x.Value.Equals(value, StringComparison.OrdinalIgnoreCase)) ?? TunerChoice.Auto;
-
-    private static string NormalizeFilter(string? value)
-    {
-        var v = (value ?? string.Empty).Trim().ToUpperInvariant();
-        return v switch
-        {
-            "T" or "TERRESTRIAL" or "地" or "地デジ" => "GR",
-            "GR" => "GR",
-            "BS" => "BS",
-            "CS" => "CS",
-            "CATV" or "ISDB-C" or "CABLE" => "CATV",
-            _ => "ALL"
-        };
-    }
-
-    private static string NormalizeWaveFilter(string? value)
-    {
-        var v = NormalizeFilter(value);
-        return v is "BS" or "CS" or "CATV" ? v : "GR";
-    }
-
-    private static string FilterLabel(string group)
-    {
-        switch (NormalizeFilter(group))
-        {
-            case "GR":
-                return "地デジ";
-            case "BS":
-                return "BS";
-            case "CS":
-                return "CS";
-            case "CATV":
-                return "CATV";
-            default:
-                return "全";
-        }
-    }
-    private static string ServiceKey(int nid, int tsid, int sid) => nid + ":" + tsid + ":" + sid;
-
-    private static bool IsToolWindow(RuntimeUiRenderContext c)
-    {
-        // ToolWindow判定はTvAIr本体から渡るhost-managed contextだけを正とする。
-        // __tvairToolHost系クエリは通常ブラウザ側のreturnUrlへ混入し得るため、
-        // それ単体でToolWindow扱いにしない。
-        return c.IsHostManagedWindowContent || !string.IsNullOrWhiteSpace(c.CurrentWindowId);
-    }
-
-    private static string QueryWindowId(RuntimeUiRenderContext c)
-    {
-        // Host-managed ToolWindowではCurrentWindowIdが唯一の正本。
-        // route/query内のwindowIdはreturnUrlや過去navigation由来の値を含み得るため、
-        // liveなToolWindow subscriptionへ逆投影してはならない。
-        var currentWindowId = (c.CurrentWindowId ?? string.Empty).Trim();
-        if (c.IsHostManagedWindowContent || !string.IsNullOrWhiteSpace(currentWindowId))
-            return currentWindowId;
-
-        // 非host-managed描画だけ互換入力としてquery由来IDを許可する。
-        var q = ExtractQueryDictionary(c);
-        foreach (var key in new[] { "__tvairWindowId", "_tvairWindowId", "currentWindowId", "windowId" })
-            if (q.TryGetValue(key, out var v) && !string.IsNullOrWhiteSpace(v)) return v.Trim();
-        return string.Empty;
-    }
-
-    private static Dictionary<string, string> ExtractQueryDictionary(RuntimeUiRenderContext c)
-    {
-        var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var name in new[]
-        {
-            "QueryString", "RawQuery", "PathAndQuery", "RawUrl", "Url", "RequestUrl", "AbsoluteUrl", "OriginalUrl",
-            "RequestQuery", "Query", "RouteQuery", "CurrentQueryString", "CurrentContentRoute", "ContentRoute"
-        })
-        {
-            var raw = ReadProperty(c, name)?.ToString();
-            MergeQuery(dict, raw);
-        }
-
-        // TvAIr本体が将来Query専用propertyを増やしても拾えるよう、URL/Route/Query系string propertyは横断的に見る。
-        foreach (var prop in c.GetType().GetProperties())
-        {
-            if (prop.PropertyType != typeof(string)) continue;
-            var name = prop.Name ?? string.Empty;
-            if (!(name.Contains("Query", StringComparison.OrdinalIgnoreCase)
-                || name.Contains("Url", StringComparison.OrdinalIgnoreCase)
-                || name.Contains("Route", StringComparison.OrdinalIgnoreCase)
-                || name.Contains("Path", StringComparison.OrdinalIgnoreCase))) continue;
-            try { MergeQuery(dict, prop.GetValue(c)?.ToString()); } catch { }
-        }
-
-        foreach (var mapName in new[] { "WindowContract", "ActionContract", "ToolWindowCapabilities", "ViewerControlActionContract" })
-        {
-            var map = ReadStringDictionary(c, mapName);
-            foreach (var kv in map)
-            {
-                if (!string.IsNullOrWhiteSpace(kv.Key) && kv.Key.Equals("wave", StringComparison.OrdinalIgnoreCase)) dict["wave"] = kv.Value;
-                MergeQuery(dict, kv.Value);
-            }
-        }
-        return dict;
-    }
-
-    private static void MergeQuery(Dictionary<string, string> dict, string? query)
-    {
-        if (string.IsNullOrWhiteSpace(query)) return;
-        var q = query;
-        var idx = q.IndexOf('?');
-        if (idx >= 0) q = q[(idx + 1)..];
-        var hash = q.IndexOf('#');
-        if (hash >= 0) q = q[..hash];
-        foreach (var pair in q.Split('&', StringSplitOptions.RemoveEmptyEntries))
-        {
-            var parts = pair.Split('=', 2);
-            var key = WebUtility.UrlDecode(parts[0] ?? string.Empty) ?? string.Empty;
-            var value = parts.Length > 1 ? WebUtility.UrlDecode(parts[1] ?? string.Empty) ?? string.Empty : string.Empty;
-            if (!string.IsNullOrWhiteSpace(key)) dict[key] = value;
-        }
-    }
-
-    private static string PayloadValue(RuntimeUiActionContext request, params string[] keys)
-    {
-        foreach (var key in keys)
-        {
-            if (request.Payload.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value)) return value.Trim();
-        }
-        return string.Empty;
-    }
-
-    private static string QueryString(IReadOnlyDictionary<string, string> query, string key) => query.TryGetValue(key, out var v) ? v : string.Empty;
-
-    private static string ReadString(object? obj, params string[] names)
-    {
-        foreach (var name in names)
-        {
-            var v = ReadProperty(obj, name)?.ToString();
-            if (!string.IsNullOrWhiteSpace(v)) return v;
-        }
-        return string.Empty;
-    }
-
-    private static Dictionary<string, string> ReadStringDictionary(object? obj, params string[] names)
-    {
-        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var name in names)
-        {
-            var value = ReadProperty(obj, name);
-            if (value is System.Collections.IDictionary d)
-            {
-                foreach (System.Collections.DictionaryEntry e in d)
-                {
-                    var k = e.Key?.ToString();
-                    if (!string.IsNullOrWhiteSpace(k)) result[k] = e.Value?.ToString() ?? string.Empty;
-                }
-            }
-            else if (value is System.Collections.IEnumerable en && value is not string)
-            {
-                foreach (var item in en)
-                {
-                    var k = ReadProperty(item, "Key")?.ToString();
-                    if (!string.IsNullOrWhiteSpace(k)) result[k] = ReadProperty(item, "Value")?.ToString() ?? string.Empty;
-                }
-            }
-        }
-        return result;
-    }
-
-    private static bool ReadDictBool(IReadOnlyDictionary<string, string> a, IReadOnlyDictionary<string, string> b, string key)
-    {
-        if ((a.TryGetValue(key, out var v) || b.TryGetValue(key, out v)) && bool.TryParse(v, out var parsed)) return parsed;
-        return false;
-    }
-
-    private static string GetValue(IReadOnlyDictionary<string, string> dict, string key) => dict.TryGetValue(key, out var v) ? v : string.Empty;
-
-    private static IReadOnlyList<string> SplitCsv(string? value)
-        => string.IsNullOrWhiteSpace(value)
-            ? Array.Empty<string>()
-            : value.Split(new[] { ',', '|', ';' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-
-    private static object? ReadProperty(object? obj, string name)
-    {
-        if (obj == null) return null;
-        var prop = obj.GetType().GetProperty(name);
-        if (prop == null) return null;
-        try { return prop.GetValue(obj); } catch { return null; }
-    }
-
-    private static string FirstNonEmpty(params string?[] values) => values.FirstOrDefault(x => !string.IsNullOrWhiteSpace(x))?.Trim() ?? string.Empty;
-    private static string Html(string? value) => WebUtility.HtmlEncode(value ?? string.Empty);
-    private static string HtmlAttr(string? value) => Html(value).Replace("\"", "&quot;");
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-    private void SafeLog(string message)
-    {
-        try { AIrConNewApiBridge.LogInfo("AIrCon: " + message); } catch { }
-    }
-#endif
-
-    private sealed record ViewerSessionContractState(string ViewerSessionId, long Generation);
-    private sealed record ZappingState(bool Active, DateTimeOffset StartedAt, DateTimeOffset LastTickAt, DateTimeOffset NextTickAt, string LastServiceKey, string WindowId, string Wave, string ViewerProfile, long Generation, string ViewerSessionId, long ViewerGeneration, int ProcessId, int IntervalSeconds);
-    private sealed record PowerOffState(bool Active, DateTimeOffset Deadline, string ViewerProfile, string WindowId, long Generation);
-    private sealed record ZappingTickResult(bool Success, string Diagnostics);
-
-    private sealed record FocusTriplet(int? NetworkId, int? TransportStreamId, int? ServiceId)
-    {
-        public bool IsResolved => NetworkId.GetValueOrDefault() > 0 && TransportStreamId.GetValueOrDefault() > 0 && ServiceId.GetValueOrDefault() > 0;
-    }
-
-    private sealed record ViewerStartPayload(string NetworkId, string TransportStreamId, string ServiceId, string ChannelSpace, string ChannelIndex, string ChannelArgument, string ProgramGuideFilterGroup, string BroadcastGroup, string AllocationGroup, string TunerGroup, string ServiceName, string PreferredTunerName, string PreferredDid, string PreferredSlot, string ViewerProfile, string ViewerProfileName);
-    private sealed record FloatingViewerData(IReadOnlyList<ServiceRow> Services, IReadOnlyList<ViewerSessionRow> ViewerSessions, IReadOnlyList<ViewerTunerRow> ViewerTuners, IReadOnlyList<WaveFilterRow> WaveFilters, ViewerProfileState ViewerProfiles, IReadOnlyList<TvAirProgramEventDto> ProgramEvents, IReadOnlyList<TvAirViewerReservation> ViewerReservations, bool ProjectionUsed, bool SafeEventContractAvailable, bool SafeDblclickEvents, int ServiceColumnWidthPx);
-    private sealed record ViewerOperation(bool CanPost, string ActionEndpoint, string ActionRoute, string ActionMethod, string ActionToken, string PluginId, string RouteSegment);
-    private sealed record HostActionDispatchResult(bool Success, string Diagnostics, string Message)
-    {
-        public static HostActionDispatchResult Ok(string diagnostics) => new(true, diagnostics, "OK");
-        public static HostActionDispatchResult Failure(string diagnostics, string message) => new(false, diagnostics, message);
-    }
-    private sealed record WindowOperation(bool CanOpen, bool CanSelfRefresh, string WindowEndpoint, string WindowRoute, string WindowMethod, string WindowToken, string PluginId, string RouteSegment, string WindowId, string WindowStateEndpoint, bool ToolWindowSupported);
-    private sealed record ViewerSessionRow(string LeaseId, string ServiceName, string ProgramGuideFilterGroup, string AllocationGroup, string TunerGroup, string TunerName, string Did, int SlotIndex, ushort? NetworkId, ushort? TransportStreamId, ushort? ServiceId, bool Current, string ViewerState, string ViewerProfile, string ViewerProfileName, string TvTestPathKey, string ViewerSessionId, long Generation, int? ProcessId)
-    {
-        public bool IsActive => Current || ViewerState.Equals("launched", StringComparison.OrdinalIgnoreCase) || ViewerState.Equals("active", StringComparison.OrdinalIgnoreCase) || ViewerState.Equals("viewing", StringComparison.OrdinalIgnoreCase);
-    }
-    private sealed record ViewerProfileChoice(string Value, string Name, bool Enabled, bool IsDefault, int Order, IReadOnlyList<string> AvailableGroups, int TvTestFrameIndex, string LogicalViewerSlotId, bool IsShared)
-    {
-        public string Id => Value;
-        public bool IsAvailableForWave(string wave)
-        {
-            if (AvailableGroups == null || AvailableGroups.Count == 0) return NormalizeWaveFilter(wave) != "CATV";
-            var required = RequiredProfileGroupForWave(wave);
-            return AvailableGroups.Any(x => NormalizeAvailableGroup(x).Equals(required, StringComparison.OrdinalIgnoreCase));
-        }
-        public static ViewerProfileChoice Unavailable { get; } = new(string.Empty, string.Empty, false, false, 0, Array.Empty<string>(), 0, string.Empty, false);
-    }
-
-    private sealed record ViewerProfileState(IReadOnlyList<ViewerProfileChoice> SelectableProfiles, string DefaultViewerProfile, bool SelectorVisibleRecommended, bool MinWidthInvariantRequired, bool ContractAvailable)
-    {
-        public IEnumerable<ViewerProfileChoice> AvailableForWave(string wave) => SelectableProfiles.Where(x => x.Enabled && x.IsAvailableForWave(wave));
-        public static ViewerProfileState Unavailable { get; } = new(Array.Empty<ViewerProfileChoice>(), string.Empty, false, true, false);
-    }
-
-    private sealed record ViewerTunerRow(string Name, string Did, int SlotIndex, string ProgramGuideFilterGroup, string AllocationGroup, bool Busy, bool IsSelectableForViewer, string Role);
-    private sealed record WaveFilterRow(string Key, string Group, string Label);
-    private sealed record TunerChoice(string Value, string Name, string Did, int SlotIndex, string Label, bool IsAuto)
-    {
-        public static TunerChoice Auto { get; } = new("auto", string.Empty, string.Empty, -1, "自動", true);
-    }
-
-    private sealed class ServiceRow
-    {
-        public int ProgramGuideOrder { get; set; }
-        public string ProgramGuideFilterGroup { get; set; } = "GR";
-        public string ProgramGuideFilterLabel { get; set; } = "地デジ";
-        public string AllocationGroup { get; set; } = "GR";
-        public string TunerGroup { get; set; } = "GR";
-        public string ServiceName { get; set; } = string.Empty;
-        public int NetworkId { get; set; }
-        public int TransportStreamId { get; set; }
-        public int ServiceId { get; set; }
-        public int ChannelSpace { get; set; }
-        public int ChannelIndex { get; set; }
-        public string ChannelArgument { get; set; } = string.Empty;
-        public string CurrentTitle { get; set; } = string.Empty;
-        public DateTimeOffset? CurrentStart { get; set; }
-        public DateTimeOffset? CurrentEnd { get; set; }
-        public bool HasCurrentProgramProjection { get; set; }
-        public bool IsViewing { get; set; }
-        public string ViewingViewerProfile { get; set; } = string.Empty;
-    }
 }
-
-internal sealed record AirConSettings(bool RememberWindowPlacement, int ZappingIntervalSeconds, string StartupWave);
-
-public sealed class AIrConRuntimePlugin : ITvAirRuntimeCapabilityPlugin, ITvAirRuntimeUiPlugin, ITvAirRuntimeLifecyclePlugin
-{
-    public TvAirPluginRuntimeDescriptor Descriptor { get; } = new()
-    {
-        PluginId = AIrConRenderer.PluginId,
-        DisplayName = AIrConRenderer.PluginListTitle,
-        Version = AIrConRenderer.PluginVersion,
-        SdkContractVersion = TvAIrPluginSdkContract.HostContractVersion,
-        RequiredCapabilities = new[] { TvAirRuntimeCapabilities.StorageRead, TvAirRuntimeCapabilities.StorageWrite },
-        RequiredPermissions = new[]
-        {
-            PluginPermission.ShowUi,
-            PluginPermission.OpenToolWindow,
-            PluginPermission.ReadChannels,
-            PluginPermission.ReadEpg,
-            PluginPermission.ReadTunerStatus,
-            PluginPermission.ControlViewer,
-            PluginPermission.ReadProgramGuideProjection,
-            PluginPermission.ReadViewerSessions,
-            PluginPermission.ReadViewerTuners,
-            PluginPermission.ReadHostContracts,
-            PluginPermission.UseActionApi,
-            PluginPermission.UseWindowApi,
-            PluginPermission.UseAssetApi,
-            PluginPermission.UseSafeEvent,
-            PluginPermission.ReadTheme,
-            PluginPermission.ReadPluginStorage,
-            PluginPermission.WritePluginStorage
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-            , PluginPermission.WriteLogs
-#endif
-        },
-        Assets = new[]
-        {
-            new TvAIrPlugin.Assets.PluginAssetDefinition
-            {
-                LogicalPath = "AIrCon.ico",
-                ResourceName = "AIrCon.ico",
-                ContentType = "image/x-icon",
-                CachePolicy = TvAIrPlugin.Assets.PluginAssetCachePolicy.Revalidate
-            }
-        },
-        Windows = new[]
-        {
-            new TvAIrPlugin.Windows.PluginWindowDefinition
-            {
-                WindowDefinitionId = "main", Title = AIrConRenderer.PluginToolWindowTitle,
-                InitialSize = new TvAIrPlugin.Windows.PluginWindowSize(540, 320),
-                MinimumSize = new TvAIrPlugin.Windows.PluginWindowSize(360, 180),
-                ShowInTaskbar = true, RememberPlacement = AIrConRenderer.DefaultRememberWindowPlacement
-            }
-        },
-        Surfaces = new[]
-        {
-            new TvAIrPlugin.Surfaces.PluginSurfaceDefinition
-            {
-                SurfaceDefinitionId = "main.web", Kind = TvAIrPlugin.Surfaces.PluginSurfaceKind.Web,
-                EntryPoint = "aircon"
-            }
-        },
-        UiDefinitions = new[]
-        {
-            new RuntimeUiDefinition
-            {
-                UiDefinitionId = "main", Route = AIrConRenderer.RouteSegment, Kind = RuntimeUiKind.ToolWindow,
-                WindowDefinitionId = "main", SurfaceDefinitionId = "main.web"
-            }
-        },
-        MenuActions = new[]
-        {
-            new PluginMenuActionDefinition
-            {
-                ActionId = "open",
-                Label = AIrConRenderer.PluginListTitle,
-                Kind = PluginMenuActionKind.ToolWindow,
-                Priority = 420,
-                Route = AIrConRenderer.RouteSegment,
-                WindowDefinitionId = "main",
-                SurfaceDefinitionId = "main.web",
-                ShowInTaskbar = true
-            }
-        },
-        Lifecycle = new PluginLifecycleDefinition()
-    };
-    private readonly AIrConRenderer _ui = new();
-    private IDisposable? _runtimeEventSubscriptions;
-    public void Initialize(ITvAirPluginRuntimeContext context) => AIrConNewApiBridge.InitializeRuntime(context);
-    public string RenderHtml(RuntimeUiRenderContext context) => _ui.RenderHtml(context);
-    public Task<RuntimeUiActionResult> HandleActionAsync(RuntimeUiActionContext context, CancellationToken cancellationToken)
-        => _ui.HandleActionAsync(context, cancellationToken);
-    public void OnStart()
-    {
-        var settings = AIrConNewApiBridge.LoadSettings();
-        var placement = AIrConNewApiBridge.SetPlacementPersistence("main", settings.RememberWindowPlacement);
-        _runtimeEventSubscriptions?.Dispose();
-        _runtimeEventSubscriptions = AIrConNewApiBridge.SubscribeRuntimeEvents((eventType, eventEnvelope) =>
-        {
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            AIrConNewApiBridge.LogInfo($"PROJECTION_INVALIDATE source={eventType} action=invalidate_only windowRefresh=none rule=aircon_projection_single_source");
-            #endif
-            if (eventType.Equals("ViewerSessionChanged", StringComparison.OrdinalIgnoreCase) && eventEnvelope != null)
-                _ui.ApplyViewerSessionStatePatch(eventEnvelope);
-            else if (eventType.Equals("RuntimeWindowLifecycleChanged", StringComparison.OrdinalIgnoreCase) && eventEnvelope != null)
-                _ui.ApplyRuntimeWindowLifecycle(eventEnvelope);
-            else if (eventType.Equals("ViewerReservationChanged", StringComparison.OrdinalIgnoreCase) && eventEnvelope != null)
-                _ui.ApplyViewerReservationChanged(eventEnvelope);
-        }, _ui.ApplyViewerOperationPreempting);
-        #if AIRCON_DEVELOPER_DIAGNOSTICS
-        AIrConNewApiBridge.LogInfo($"PLACEMENT_POLICY_SYNC result={(placement.Success ? "OK" : "FAILED")} rememberPlacement={settings.RememberWindowPlacement} diagnostics={placement.Diagnostics}");
-        #endif
-        #if AIRCON_DEVELOPER_DIAGNOSTICS
-        AIrConNewApiBridge.LogInfo("PROJECTION_LIFECYCLE result=STARTED service=plugin_instance viewerProfile=plugin_instance viewerSession=plugin_instance program=plugin_instance subscriptions=ProgramGuideUpdated,ViewerSessionChanged,SettingsChanged,RuntimeWindowLifecycleChanged,ViewerReservationChanged,ViewerOperationPreempting rule=aircon_projection_single_source");
-        #endif
-    }
-    public void OnStop()
-    {
-        _runtimeEventSubscriptions?.Dispose();
-        _runtimeEventSubscriptions = null;
-        _ui.StopRuntimeUi();
-        AIrConNewApiBridge.ResetRuntime();
-    }
-}
-
-internal static class AIrConNewApiBridge
-{
-    private static readonly object Sync = new();
-    private static ITvAirPluginRuntimeContext? _runtimeContext;
-    private static TvAirServiceDto[]? _serviceProjection;
-    private static TvAirProgramGuideWaveFilterDto[]? _waveFilterProjection;
-    private static TvAIrPlugin.Viewers.TvAirViewerProfileDto[]? _viewerProfileProjection;
-    private static TvAIrPlugin.Viewers.TvAirViewerSessionDto[]? _viewerSessionProjection;
-    private static TvAirProgramEventDto[]? _programProjection;
-    private static DateTimeOffset _programProjectionFrom;
-    private static DateTimeOffset _programProjectionTo;
-    private static DateTimeOffset _programProjectionExpiresAt;
-
-    internal static void InitializeRuntime(ITvAirPluginRuntimeContext context)
-    {
-        lock (Sync)
-        {
-            _runtimeContext = context;
-            InvalidateAllProjectionsLocked();
-        }
-    }
-
-    internal static void ResetRuntime()
-    {
-        lock (Sync)
-        {
-            _runtimeContext = null;
-            InvalidateAllProjectionsLocked();
-        }
-    }
-
-    internal static IDisposable SubscribeRuntimeEvents(Action<string, TvAIrPlugin.Events.PluginEventEnvelope?> onInvalidated, Action<TvAirViewerOperationPreempting> onViewerOperationPreempting)
-    {
-        var registrations = new List<IDisposable>();
-        lock (Sync)
-        {
-            var context = _runtimeContext;
-            if (context == null) return new CompositeDisposable(registrations);
-            registrations.Add(context.Events.Subscribe("ProgramGuideUpdated", _ =>
-            {
-                InvalidateProgramProjection();
-                onInvalidated("ProgramGuideUpdated", null);
-            }));
-            registrations.Add(context.Events.Subscribe("ViewerSessionChanged", eventEnvelope =>
-            {
-                InvalidateViewerProjection();
-                onInvalidated("ViewerSessionChanged", eventEnvelope);
-            }));
-            registrations.Add(context.Events.Subscribe("SettingsChanged", _ =>
-            {
-                InvalidateServiceProjection();
-                InvalidateViewerProfileProjection();
-                onInvalidated("SettingsChanged", null);
-            }));
-            registrations.Add(context.Events.Subscribe("RuntimeWindowLifecycleChanged", eventEnvelope =>
-            {
-                onInvalidated("RuntimeWindowLifecycleChanged", eventEnvelope);
-            }));
-            registrations.Add(context.Events.Subscribe("ViewerReservationChanged", eventEnvelope =>
-            {
-                onInvalidated("ViewerReservationChanged", eventEnvelope);
-            }));
-            registrations.Add(context.Viewers.SubscribeOperationPreempting(onViewerOperationPreempting));
-        }
-        return new CompositeDisposable(registrations);
-    }
-
-    internal static void InvalidateServiceProjection()
-    {
-        lock (Sync)
-        {
-            _serviceProjection = null;
-            _waveFilterProjection = null;
-        }
-    }
-
-    internal static void InvalidateViewerProfileProjection()
-    {
-        lock (Sync) _viewerProfileProjection = null;
-    }
-
-    internal static void InvalidateViewerProjection()
-    {
-        lock (Sync)
-        {
-            _viewerSessionProjection = null;
-        }
-    }
-
-    internal static void InvalidateProgramProjection()
-    {
-        lock (Sync)
-        {
-            _programProjection = null;
-            _programProjectionFrom = default;
-            _programProjectionTo = default;
-            _programProjectionExpiresAt = default;
-        }
-    }
-
-    private static void InvalidateAllProjectionsLocked()
-    {
-        _serviceProjection = null;
-        _waveFilterProjection = null;
-        _viewerProfileProjection = null;
-        _viewerSessionProjection = null;
-        _programProjection = null;
-        _programProjectionFrom = default;
-        _programProjectionTo = default;
-        _programProjectionExpiresAt = default;
-    }
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-    internal static void LogInfo(string message)
-    {
-        lock (Sync)
-        {
-            var context = _runtimeContext;
-            if (context == null) return;
-            context.Logs.Write(new TvAirLogWriteDto { Level = "Info", Category = "AIrCon", Message = message });
-        }
-    }
-#endif
-
-    internal static AirConSettings LoadSettings()
-    {
-        lock (Sync)
-        {
-            bool remember = AIrConRenderer.DefaultRememberWindowPlacement;
-            int interval = AIrConRenderer.DefaultZappingIntervalSeconds;
-            string wave = "GR";
-
-            if (_runtimeContext != null)
-            {
-                remember = ReadRuntimeStorageBool(_runtimeContext.Storage, AIrConRenderer.SettingsSection, AIrConRenderer.SettingRememberPlacement, AIrConRenderer.DefaultRememberWindowPlacement);
-                interval = ReadRuntimeStorageInt(_runtimeContext.Storage, AIrConRenderer.SettingsSection, AIrConRenderer.SettingZappingIntervalSeconds, AIrConRenderer.DefaultZappingIntervalSeconds);
-                wave = ReadRuntimeStorageString(_runtimeContext.Storage, AIrConRenderer.SettingsSection, AIrConRenderer.SettingStartupWave, "GR");
-            }
-
-            if (interval is not (30 or 60 or 90 or 120 or 180)) interval = AIrConRenderer.DefaultZappingIntervalSeconds;
-            return new AirConSettings(remember, interval, NormalizeWave(wave));
-        }
-    }
-
-    internal static OperationResult SaveSettings(bool rememberPlacement, int zappingIntervalSeconds, string startupWave)
-    {
-        try
-        {
-            lock (Sync)
-            {
-                var context = RequireRuntimeContext();
-                SetRuntimeStorage(context.Storage, AIrConRenderer.SettingsSection, AIrConRenderer.SettingRememberPlacement, rememberPlacement);
-                SetRuntimeStorage(context.Storage, AIrConRenderer.SettingsSection, AIrConRenderer.SettingZappingIntervalSeconds, zappingIntervalSeconds);
-                SetRuntimeStorage(context.Storage, AIrConRenderer.SettingsSection, AIrConRenderer.SettingStartupWave, NormalizeWave(startupWave));
-            }
-            return OperationResult.Ok("settings_saved");
-        }
-        catch (Exception ex) { return OperationResult.Fail(ex.GetType().Name, ex.Message); }
-    }
-
-    internal static OperationResult PatchToolWindow(string windowId, IReadOnlyList<RuntimeUiPatch> uiPatches, long stateRevision)
-    {
-        ITvAirPluginRuntimeContext? context;
-        lock (Sync) context = _runtimeContext;
-        if (context == null) return OperationResult.Fail("runtime_context_missing", "Runtime context is unavailable.");
-        if (string.IsNullOrWhiteSpace(windowId)) return OperationResult.Fail("window_id_missing", "Window id is unavailable.");
-        if (stateRevision <= 0) return OperationResult.Fail("state_revision_invalid", "State revision must be positive.");
-
-        try
-        {
-            var result = context.Windows.PatchToolWindow(new TvAirToolWindowStatePatchRequestDto
-            {
-                WindowId = windowId,
-                UiPatches = uiPatches ?? Array.Empty<RuntimeUiPatch>(),
-                StateRevision = stateRevision
-            });
-            var details = result.Value;
-            var diagnostics = details == null
-                ? result.Error?.Message ?? string.Empty
-                : $"outcome={details.Outcome} requested={details.RequestedPatchCount} applied={details.AppliedPatchCount} revision={details.StateRevision} reason={details.Reason}";
-            return result.Succeeded
-                ? OperationResult.Ok(string.IsNullOrWhiteSpace(diagnostics) ? "statepatch_applied" : diagnostics)
-                : OperationResult.Fail(result.Error?.Code.ToString() ?? "statepatch_failed", result.Error?.Message ?? "StatePatch failed.");
-        }
-        catch (Exception ex)
-        {
-            return OperationResult.Fail("statepatch_exception", ex.Message);
-        }
-    }
-
-    internal static OperationResult SetPlacementPersistence(string windowDefinitionId, bool rememberPlacement)
-    {
-        try
-        {
-            ITvAirPluginRuntimeContext context;
-            lock (Sync)
-                context = _runtimeContext ?? throw new InvalidOperationException("AIrCon Runtime APIが初期化されていません。");
-
-            var result = context.Windows.SetToolWindowPlacementPersistence(new TvAirToolWindowPlacementPersistenceRequestDto
-            {
-                WindowDefinitionId = windowDefinitionId,
-                RememberPlacement = rememberPlacement,
-                ClearSavedPlacement = false
-            });
-            return result.Succeeded
-                ? OperationResult.Ok("placement_persistence_updated")
-                : OperationResult.Fail(result.Error?.Code.ToString() ?? "placement_persistence_failed", result.Value?.FailureReason ?? result.Error?.Message ?? "位置記憶設定に失敗しました。");
-        }
-        catch (Exception ex) { return OperationResult.Fail(ex.GetType().Name, ex.Message); }
-    }
-
-    private static bool ReadRuntimeStorageBool(TvAIrPlugin.Storage.ITvAirPluginStorageApi storage, string ns, string key, bool defaultValue)
-    {
-        var result = storage.Get(ns, key);
-        if (!result.Succeeded || result.Value?.Value == null) return defaultValue;
-        return TryConvertStorageBool(result.Value.Value, out var value) ? value : defaultValue;
-    }
-
-    private static bool TryConvertStorageBool(object raw, out bool value)
-    {
-        switch (raw)
-        {
-            case bool boolValue:
-                value = boolValue;
-                return true;
-            case string text:
-                if (bool.TryParse(text, out value)) return true;
-                if (text == "1") { value = true; return true; }
-                if (text == "0") { value = false; return true; }
-                break;
-            case byte byteValue when byteValue is 0 or 1:
-                value = byteValue == 1;
-                return true;
-            case sbyte sbyteValue when sbyteValue is 0 or 1:
-                value = sbyteValue == 1;
-                return true;
-            case short shortValue when shortValue is 0 or 1:
-                value = shortValue == 1;
-                return true;
-            case ushort ushortValue when ushortValue is 0 or 1:
-                value = ushortValue == 1;
-                return true;
-            case int intValue when intValue is 0 or 1:
-                value = intValue == 1;
-                return true;
-            case uint uintValue when uintValue is 0 or 1:
-                value = uintValue == 1;
-                return true;
-            case long longValue when longValue is 0 or 1:
-                value = longValue == 1;
-                return true;
-            case ulong ulongValue when ulongValue is 0 or 1:
-                value = ulongValue == 1;
-                return true;
-            case JsonElement element:
-                if (element.ValueKind == JsonValueKind.True) { value = true; return true; }
-                if (element.ValueKind == JsonValueKind.False) { value = false; return true; }
-                if (element.ValueKind == JsonValueKind.String)
-                    return TryConvertStorageBool(element.GetString() ?? string.Empty, out value);
-                if (element.ValueKind == JsonValueKind.Number && element.TryGetInt64(out var numeric))
-                    return TryConvertStorageBool(numeric, out value);
-                break;
-        }
-
-        value = false;
-        return false;
-    }
-
-    private static int ReadRuntimeStorageInt(TvAIrPlugin.Storage.ITvAirPluginStorageApi storage, string ns, string key, int defaultValue)
-    {
-        var result = storage.Get(ns, key);
-        if (!result.Succeeded || result.Value?.Value == null) return defaultValue;
-        return TryConvertStorageInt(result.Value.Value, out var value) ? value : defaultValue;
-    }
-
-    private static bool TryConvertStorageInt(object raw, out int value)
-    {
-        switch (raw)
-        {
-            case int intValue:
-                value = intValue;
-                return true;
-            case long longValue when longValue is >= int.MinValue and <= int.MaxValue:
-                value = (int)longValue;
-                return true;
-            case string text when int.TryParse(text, out var parsed):
-                value = parsed;
-                return true;
-            case JsonElement element when element.ValueKind == JsonValueKind.Number && element.TryGetInt32(out var jsonInt):
-                value = jsonInt;
-                return true;
-            case JsonElement element when element.ValueKind == JsonValueKind.String && int.TryParse(element.GetString(), out var jsonStringInt):
-                value = jsonStringInt;
-                return true;
-            default:
-                value = default;
-                return false;
-        }
-    }
-
-    private static string ReadRuntimeStorageString(TvAIrPlugin.Storage.ITvAirPluginStorageApi storage, string ns, string key, string defaultValue)
-    {
-        var result = storage.Get(ns, key);
-        if (!result.Succeeded || result.Value?.Value == null) return defaultValue;
-        return result.Value.Value is JsonElement element
-            ? element.ValueKind == JsonValueKind.String ? element.GetString() ?? defaultValue : element.ToString()
-            : Convert.ToString(result.Value.Value) ?? defaultValue;
-    }
-
-    private static void SetRuntimeStorage(TvAIrPlugin.Storage.ITvAirPluginStorageApi storage, string ns, string key, object value)
-    {
-        var result = storage.Set(ns, key, value);
-        if (!result.Succeeded)
-            throw new InvalidOperationException(result.Error?.Message ?? $"Plugin Storage書込に失敗しました: {ns}/{key}");
-    }
-
-    internal static IReadOnlyList<TvAirServiceDto> ListServices()
-    {
-        lock (Sync)
-        {
-            if (_serviceProjection != null) return _serviceProjection;
-            _serviceProjection = _runtimeContext?.Channels.ListServices(new TvAirServiceQueryDto { Enabled = true }).ToArray()
-                ?? Array.Empty<TvAirServiceDto>();
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            LogProjection("SERVICE_PROJECTION", "MISS", _serviceProjection.Length);
-            #endif
-            return _serviceProjection;
-        }
-    }
-
-    internal static IReadOnlyList<TvAirProgramGuideWaveFilterDto> ListWaveFilters()
-    {
-        lock (Sync)
-        {
-            if (_waveFilterProjection != null) return _waveFilterProjection;
-            _waveFilterProjection = _runtimeContext?.ProgramGuide.ListWaveFilters().ToArray()
-                ?? Array.Empty<TvAirProgramGuideWaveFilterDto>();
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            LogProjection("WAVE_FILTER_PROJECTION", "MISS", _waveFilterProjection.Length);
-            #endif
-            return _waveFilterProjection;
-        }
-    }
-
-    internal static IReadOnlyList<TvAirProgramEventDto> ListProgramEvents(DateTimeOffset from, DateTimeOffset to)
-    {
-        lock (Sync)
-        {
-            var now = DateTimeOffset.Now;
-            var cacheValid = _programProjection != null
-                && now < _programProjectionExpiresAt
-                && from >= _programProjectionFrom
-                && to <= _programProjectionTo;
-            if (!cacheValid)
-            {
-                // RenderHtml asks for [now, now+6h]. Cache a deliberate superset so
-                // the next render's slightly advanced upper bound remains covered.
-                // Freshness is owned by ProgramGuideUpdated and the nearest programme
-                // boundary, not by comparing two independently sampled now values.
-                var queryFrom = from.AddMinutes(-1);
-                var queryTo = to.AddMinutes(10);
-                _programProjection = _runtimeContext?.ProgramGuide.ListEvents(new TvAirProgramGuideQueryDto
-                {
-                    From = queryFrom,
-                    To = queryTo,
-                    Limit = 20000
-                }).ToArray() ?? Array.Empty<TvAirProgramEventDto>();
-                _programProjectionFrom = queryFrom;
-                _programProjectionTo = queryTo;
-
-                var nextBoundary = _programProjection
-                    .Where(x => x.Start <= now && x.End > now)
-                    .Select(x => x.End)
-                    .DefaultIfEmpty(now.AddMinutes(5))
-                    .Min();
-                var safetyExpiry = now.AddMinutes(5);
-                _programProjectionExpiresAt = nextBoundary < safetyExpiry ? nextBoundary : safetyExpiry;
-                #if AIRCON_DEVELOPER_DIAGNOSTICS
-                LogProgramProjection("MISS", _programProjection.Length, queryFrom, queryTo, _programProjectionExpiresAt);
-                #endif
-            }
-            else
-            {
-                #if AIRCON_DEVELOPER_DIAGNOSTICS
-                LogProgramProjection("HIT", _programProjection!.Length, _programProjectionFrom, _programProjectionTo, _programProjectionExpiresAt);
-                #endif
-            }
-            return _programProjection!
-                .Where(x => x.End > from && x.Start < to)
-                .ToArray();
-        }
-    }
-
-    internal static IReadOnlyList<TvAIrPlugin.Viewers.TvAirViewerProfileDto> ListProfiles()
-    {
-        lock (Sync)
-        {
-            if (_viewerProfileProjection != null) return _viewerProfileProjection;
-            _viewerProfileProjection = _runtimeContext?.Viewers.ListProfiles().ToArray() ?? Array.Empty<TvAIrPlugin.Viewers.TvAirViewerProfileDto>();
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            LogProjection("VIEWER_PROFILE_PROJECTION", "MISS", _viewerProfileProjection.Length);
-            #endif
-            return _viewerProfileProjection;
-        }
-    }
-
-    internal static IReadOnlyList<TvAIrPlugin.Viewers.TvAirViewerSessionDto> ListSessions()
-    {
-        lock (Sync)
-        {
-            if (_viewerSessionProjection != null) return _viewerSessionProjection;
-            _viewerSessionProjection = _runtimeContext?.Viewers.ListSessions().ToArray() ?? Array.Empty<TvAIrPlugin.Viewers.TvAirViewerSessionDto>();
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            LogProjection("VIEWER_SESSION_PROJECTION", "MISS", _viewerSessionProjection.Length);
-            #endif
-            return _viewerSessionProjection;
-        }
-    }
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-
-    [System.Diagnostics.Conditional("AIRCON_DEVELOPER_DIAGNOSTICS")]
-    private static void LogProgramProjection(string result, int count, DateTimeOffset from, DateTimeOffset to, DateTimeOffset expiresAt)
-    {
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-        var context = _runtimeContext;
-        if (context == null) return;
-        context.Logs.Write(new TvAirLogWriteDto
-        {
-            Level = "Info",
-            Category = "AIrCon",
-            Message = $"PROGRAM_NOW_NEXT_PROJECTION result={result} count={count} cacheFrom={from:O} cacheTo={to:O} expiresAt={expiresAt:O} owner=plugin_instance invalidation=event_boundary_or_manual_refresh rule=aircon_projection_single_source"
-        });
-#endif
-    }
-#endif
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-
-    [System.Diagnostics.Conditional("AIRCON_DEVELOPER_DIAGNOSTICS")]
-    private static void LogProjection(string name, string result, int count)
-    {
-#if AIRCON_DEVELOPER_DIAGNOSTICS
-        var context = _runtimeContext;
-        if (context == null) return;
-        context.Logs.Write(new TvAirLogWriteDto
-        {
-            Level = "Info",
-            Category = "AIrCon",
-            Message = $"{name} result={result} count={count} owner=plugin_instance invalidation=event_or_manual_refresh rule=aircon_projection_single_source"
-        });
-#endif
-    }
-#endif
-
-    private sealed class CompositeDisposable : IDisposable
-    {
-        private readonly List<IDisposable> _items;
-        private int _disposed;
-        internal CompositeDisposable(List<IDisposable> items) => _items = items;
-        public void Dispose()
-        {
-            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-            foreach (var item in _items)
-            {
-                try { item.Dispose(); } catch { }
-            }
-            _items.Clear();
-        }
-    }
-
-    internal static TvAIrPlugin.Viewers.TvAirViewerSessionDto? GetSession(string viewerSessionId)
-    {
-        lock (Sync)
-        {
-            var context = _runtimeContext;
-            if (context == null || string.IsNullOrWhiteSpace(viewerSessionId)) return null;
-            return context.Viewers.GetSession(viewerSessionId);
-        }
-    }
-
-    internal static IReadOnlyList<TvAirViewerReservation> ListViewerReservations()
-    {
-        lock (Sync)
-        {
-            var context = RequireRuntimeContext();
-            return context.ViewerReservations.List(new TvAirViewerReservationQuery { IncludeTerminal = false }).ToArray();
-        }
-    }
-
-    internal static async Task<OperationResult> CreateViewerReservationAsync(string viewerProfileId, ushort networkId, ushort transportStreamId, ushort serviceId, ushort eventId, DateTimeOffset scheduledStart, DateTimeOffset scheduledEnd)
-    {
-        try
-        {
-            var context = RequireRuntimeContext();
-            var result = await context.ViewerReservations.CreateAsync(new TvAirViewerReservationCreateRequest
-            {
-                ViewerProfileId = viewerProfileId,
-                Service = new TvAirServiceIdentityDto
-                {
-                    NetworkId = networkId,
-                    TransportStreamId = transportStreamId,
-                    ServiceId = serviceId
-                },
-                EventId = eventId,
-                ScheduledStart = scheduledStart,
-                ScheduledEnd = scheduledEnd
-            }).ConfigureAwait(false);
-            return result.Succeeded && result.Value != null
-                ? OperationResult.Ok("viewer_reservation_created")
-                : OperationResult.Fail(result.Error?.Code.ToString() ?? "viewer_reservation_create_failed", result.Error?.Message ?? "視聴予約を登録できません。");
-        }
-        catch (Exception ex) { return OperationResult.Fail(ex.GetType().Name, ex.Message); }
-    }
-
-    internal static async Task<OperationResult> CancelViewerReservationAsync(string reservationId)
-    {
-        try
-        {
-            var context = RequireRuntimeContext();
-            var result = await context.ViewerReservations.CancelAsync(reservationId).ConfigureAwait(false);
-            return result.Succeeded
-                ? OperationResult.Ok("viewer_reservation_cancelled")
-                : OperationResult.Fail(result.Error?.Code.ToString() ?? "viewer_reservation_cancel_failed", result.Error?.Message ?? "視聴予約を解除できません。");
-        }
-        catch (Exception ex) { return OperationResult.Fail(ex.GetType().Name, ex.Message); }
-    }
-
-    internal static async Task<OperationResult> TuneAsync(string viewerProfileId, string wave, int networkId, int transportStreamId, int serviceId, string? requiredSessionId = null, long? requiredGeneration = null, int? requiredProcessId = null, string? viewerActivation = null)
-    {
-        try
-        {
-            var context = RequireRuntimeContext();
-            var normalizedWave = NormalizeWave(wave);
-            ValidateProfile(context, viewerProfileId, normalizedWave);
-            var service = context.Channels.ListServices(new TvAirServiceQueryDto { Enabled = true })
-                .FirstOrDefault(x => x.NetworkId == networkId && x.TransportStreamId == transportStreamId && x.ServiceId == serviceId);
-            if (service is null) return OperationResult.Fail("service_not_found", "選択した局が見つかりません。");
-            if (networkId is < 0 or > ushort.MaxValue || transportStreamId is < 0 or > ushort.MaxValue || serviceId is < 0 or > ushort.MaxValue)
-                return OperationResult.Fail("service_identity_out_of_range", "局識別子が範囲外です。");
-            var profiles = context.Viewers.ListProfiles();
-            var profile = profiles.First(x => x.ViewerProfileId.Equals(viewerProfileId, StringComparison.Ordinal));
-            var sessions = context.Viewers.ListSessions();
-            var currentMatches = sessions.Where(x => x.ViewerProfileId.Equals(viewerProfileId, StringComparison.Ordinal)).ToArray();
-            if (currentMatches.Length > 1)
-                return OperationResult.Fail("viewer_profile_duplicate_sessions", "視聴状態を確認できません。もう一度お試しください。");
-            var current = currentMatches.FirstOrDefault();
-            if (current is null)
-            {
-                var slotOccupants = sessions.Where(x =>
-                    !string.IsNullOrWhiteSpace(x.LogicalViewerSlotId)
-                    && x.LogicalViewerSlotId.Equals(profile.LogicalViewerSlotId, StringComparison.Ordinal)
-                    && !x.ViewerProfileId.Equals(viewerProfileId, StringComparison.Ordinal)).ToArray();
-                if (slotOccupants.Length > 0)
-                    return OperationResult.Fail("viewer_slot_occupied", "選択した視聴先は使用中です。");
-            }
-            if (!TvAirViewerActivation.Activate.Equals(viewerActivation, StringComparison.OrdinalIgnoreCase)
-                && !TvAirViewerActivation.Preserve.Equals(viewerActivation, StringComparison.OrdinalIgnoreCase))
-                return OperationResult.Fail("viewer_activation_invalid", "Viewer Activation指定が不正です。");
-            if (!string.IsNullOrWhiteSpace(requiredSessionId))
-            {
-                if (current is null || !current.ViewerSessionId.Equals(requiredSessionId, StringComparison.Ordinal) || current.Generation != requiredGeneration || current.ProcessId != requiredProcessId)
-                    return OperationResult.Fail("viewer_identity_changed", "ザッピング開始時に固定したTVTestと現在のTVTestが一致しません。");
-            }
-            var result = await context.Viewers.StartAsync(new TvAirViewerStartRequest
-            {
-                ViewerProfileId = viewerProfileId,
-                Service = new TvAirServiceIdentityDto
-                {
-                    NetworkId = (ushort)networkId,
-                    TransportStreamId = (ushort)transportStreamId,
-                    ServiceId = (ushort)serviceId,
-                    ServiceName = service.ServiceName
-                },
-                ViewerSessionId = current?.ViewerSessionId,
-                ExpectedGeneration = current?.Generation,
-                PreserveViewerWindowState = true,
-                ViewerActivation = viewerActivation,
-                RetuneExistingViewer = current is not null
-            }).ConfigureAwait(false);
-            if (!result.Succeeded || result.Value is null)
-                return OperationResult.Fail(result.Error?.Code.ToString() ?? "viewer_start_failed", result.Error?.Message ?? "選局に失敗しました。");
-            return OperationResult.FromViewer(current is null ? "viewer_started" : "viewer_retuned", result.Value);
-        }
-        catch (Exception ex) { return OperationResult.Fail(ex.GetType().Name, ex.Message); }
-    }
-
-
-
-    internal static OperationResult RefreshToolWindow(string windowId, string? contentRoute)
-    {
-        try
-        {
-            if (string.IsNullOrWhiteSpace(windowId))
-                return OperationResult.Fail("window_id_missing", "AIrCon画面を更新できませんでした。");
-            var context = RequireRuntimeContext();
-            var result = context.Windows.RefreshToolWindow(new TvAirToolWindowRefreshRequestDto
-            {
-                WindowId = windowId,
-                ContentRoute = contentRoute
-            });
-            return result.Succeeded
-                ? OperationResult.Ok("toolwindow_refreshed")
-                : OperationResult.Fail(result.Error?.Code.ToString() ?? "toolwindow_refresh_failed", result.Error?.Message ?? "AIrCon画面を更新できませんでした。");
-        }
-        catch (Exception ex)
-        {
-            return OperationResult.Fail(ex.GetType().Name, ex.Message);
-        }
-    }
-
-    internal static async Task<OperationResult> ActivateAsync(string viewerProfileId)
-    {
-        try
-        {
-            var context = RequireRuntimeContext();
-            var session = context.Viewers.ListSessions().FirstOrDefault(x => x.ViewerProfileId.Equals(viewerProfileId, StringComparison.Ordinal));
-            if (session is null) return OperationResult.Fail("viewer_session_not_found", "対象TVTestは起動していません。");
-            var result = await context.Viewers.ActivateAsync(new TvAirViewerActivateRequest
-            {
-                ViewerSessionId = session.ViewerSessionId,
-                ExpectedGeneration = session.Generation
-            }).ConfigureAwait(false);
-            if (!result.Succeeded || result.Value is null)
-            {
-                // Activate is intentionally non-starting. The host may discover that the projected
-                // process exited, synchronously close the stale ViewerSession/lease, and report the
-                // operation as skipped. Some capability adapters surface that skipped outcome as a
-                // non-success result, so confirm the authoritative post-operation session state
-                // before classifying it as an error. Only disappearance of the exact session that
-                // we attempted to activate is accepted here; genuine activation failures remain errors.
-                var sessionStillExists = context.Viewers.ListSessions().Any(x =>
-                    x.ViewerSessionId.Equals(session.ViewerSessionId, StringComparison.Ordinal) &&
-                    !x.State.Equals("stopped", StringComparison.OrdinalIgnoreCase) &&
-                    !x.State.Equals("closed", StringComparison.OrdinalIgnoreCase));
-                if (!sessionStillExists)
-                    return OperationResult.Ok("viewer_process_exited_recovered");
-
-                return OperationResult.Fail(result.Error?.Code.ToString() ?? "viewer_activate_failed", result.Error?.Message ?? "TVTestの前面化に失敗しました。");
-            }
-            return OperationResult.FromViewer("viewer_activated", result.Value);
-        }
-        catch (Exception ex) { return OperationResult.Fail(ex.GetType().Name, ex.Message); }
-    }
-
-    internal static async Task<OperationResult> StopAsync(string viewerProfileId)
-    {
-        try
-        {
-            var context = RequireRuntimeContext();
-            var session = context.Viewers.ListSessions().FirstOrDefault(x => x.ViewerProfileId.Equals(viewerProfileId, StringComparison.Ordinal));
-            if (session is null) return OperationResult.Ok("viewer_already_stopped");
-            var result = await context.Viewers.StopAsync(new TvAirViewerStopRequest
-            {
-                ViewerSessionId = session.ViewerSessionId,
-                ExpectedGeneration = session.Generation
-            }).ConfigureAwait(false);
-            if (!result.Succeeded || result.Value is null)
-                return OperationResult.Fail(result.Error?.Code.ToString() ?? "viewer_stop_failed", result.Error?.Message ?? "視聴停止に失敗しました。");
-            return OperationResult.FromViewer("viewer_stopped", result.Value);
-        }
-        catch (Exception ex) { return OperationResult.Fail(ex.GetType().Name, ex.Message); }
-    }
-
-    private static ITvAirPluginRuntimeContext RequireRuntimeContext() { lock (Sync) return _runtimeContext ?? throw new InvalidOperationException("AIrCon Runtimeが初期化されていません。"); }
-    private static void ValidateProfile(ITvAirPluginRuntimeContext context, string viewerProfileId, string wave)
-    {
-        if (string.IsNullOrWhiteSpace(viewerProfileId)) throw new InvalidOperationException("視聴先を選択してください。");
-        var profile = context.Viewers.ListProfiles().FirstOrDefault(x => x.ViewerProfileId.Equals(viewerProfileId, StringComparison.Ordinal));
-        if (profile is null || !profile.IsAvailable) throw new InvalidOperationException("選択した視聴先を使用できません。");
-        var accepted = profile.BroadcastGroups.Any(group =>
-        {
-            var normalized = NormalizeWave(group);
-            return wave switch
-            {
-                "GR" => normalized == "GR",
-                "CATV" => normalized == "CATV",
-                _ => normalized is "BS" or "CS" || group.Contains("BSCS", StringComparison.OrdinalIgnoreCase)
-            };
-        });
-        if (!accepted) throw new InvalidOperationException("選択した視聴先は現在の放送波に対応していません。");
-    }
-    private static string NormalizeWave(string? value)
-    {
-        var text = (value ?? string.Empty).Trim().ToUpperInvariant();
-        if (text is "CATV" or "ISDB-C" or "CABLE") return "CATV";
-        if (text == "CS" || text.Contains("CS")) return "CS";
-        if (text == "BS" || text.Contains("BS")) return "BS";
-        if (text == "GR" || text.Contains("GROUND") || text.Contains("TERRESTRIAL") || text.Contains("地上")) return "GR";
-        throw new InvalidOperationException("放送波を特定できません。");
-    }
-    internal sealed record OperationResult(
-        bool Success,
-        string Diagnostics,
-        string Message,
-        string ViewerSessionId = "",
-        long Generation = 0,
-        int? ProcessId = null,
-        int? NetworkId = null,
-        int? TransportStreamId = null,
-        int? ServiceId = null,
-        bool OperationCompleted = false,
-        bool HasWarning = false,
-        bool ContinuationRecommended = false)
-    {
-        internal static OperationResult Ok(string diagnostics) => new(true, diagnostics, "OK", OperationCompleted: true, ContinuationRecommended: true);
-        internal static OperationResult FromViewer(string diagnostics, TvAirViewerOperationDto value)
-        {
-            var focusDiagnostics = string.IsNullOrWhiteSpace(value.FocusPolicyRequested)
-                ? diagnostics
-                : diagnostics
-                    + " focusPolicyRequested=" + value.FocusPolicyRequested
-                    + " focusPolicyApplied=" + value.FocusPolicyApplied
-                    + " foregroundBeforePid=" + (value.ForegroundBeforePid?.ToString() ?? "-")
-                    + " foregroundAfterRetunePid=" + (value.ForegroundAfterRetunePid?.ToString() ?? "-")
-                    + " foregroundFinalPid=" + (value.ForegroundFinalPid?.ToString() ?? "-")
-                    + " foregroundChanged=" + value.ForegroundChanged
-                    + " changedToTargetViewer=" + value.ChangedToTargetViewer
-                    + " restorationAttempted=" + value.RestorationAttempted
-                    + " restorationSucceeded=" + value.RestorationSucceeded
-                    + " focusPreserved=" + value.FocusPreserved
-                    + " focusFailureReason=" + (string.IsNullOrWhiteSpace(value.FocusPreserveFailureReason) ? "-" : value.FocusPreserveFailureReason)
-                    + " operationCompleted=" + value.OperationCompleted
-                    + " hasWarning=" + value.HasWarning
-                    + " continuationRecommended=" + value.ContinuationRecommended;
-            return new(
-                value.OperationCompleted,
-                focusDiagnostics,
-                value.Message,
-                value.ViewerSessionId,
-                value.Generation,
-                value.ProcessId,
-                value.CurrentService?.NetworkId,
-                value.CurrentService?.TransportStreamId,
-                value.CurrentService?.ServiceId,
-                value.OperationCompleted,
-                value.HasWarning,
-                value.ContinuationRecommended);
-        }
-        internal static OperationResult Fail(string diagnostics, string message) => new(false, diagnostics, message);
-    }
-}
-

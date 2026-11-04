@@ -1,33 +1,33 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
     <ImplicitUsings>enable</ImplicitUsings>
     <Platforms>AnyCPU;x86;x64</Platforms>
     <RootNamespace>AIrCon.BasicPlugin</RootNamespace>
     <AssemblyName>AIrCon.BasicPlugin</AssemblyName>
-    <Version>1.0.9</Version>
-    <FileVersion>1.0.9.0</FileVersion>
-    <AssemblyVersion>1.0.9.0</AssemblyVersion>
-    <InformationalVersion>1.0.9</InformationalVersion>
+    <Version>1.0.10</Version>
+    <FileVersion>1.0.10.0</FileVersion>
+    <AssemblyVersion>1.0.10.0</AssemblyVersion>
+    <InformationalVersion>1.0.10</InformationalVersion>
     <OutputType>Library</OutputType>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
   </PropertyGroup>
 
   <!--
     Developer Diagnostics canonical build boundary.
-    - Public release source defaults to diagnostics OFF.
-    - For public release, the diagnostics boundary must stay OFF:
-        /p:AIrConDeveloperDiagnostics=false /p:TvAIrDeveloperDiagnostics=false
+    - Normal development builds default to diagnostics ON.
+    - An explicitly requested public build must pass:
+        /p:TvAIrPublicRelease=true /p:TvAIrDeveloperDiagnostics=false
     - Diagnostic-only logging, measurement and permissions must stay behind
       AIRCON_DEVELOPER_DIAGNOSTICS so OFF builds do not execute diagnostic work.
     - Product behavior must not depend on this boundary.
     Keep this as the single Developer Diagnostics authority; do not add parallel flags.
   -->
   <PropertyGroup>
-    <AIrConDeveloperDiagnostics Condition="'$(AIrConDeveloperDiagnostics)' == ''">false</AIrConDeveloperDiagnostics>
-    <DefineConstants Condition="'$(AIrConDeveloperDiagnostics)' == 'true'">$(DefineConstants);AIRCON_DEVELOPER_DIAGNOSTICS</DefineConstants>
+    <DefineConstants Condition="'$(TvAIrDeveloperDiagnostics)' == 'true'">$(DefineConstants);AIRCON_DEVELOPER_DIAGNOSTICS</DefineConstants>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(Platform)'=='x86'">
@@ -45,4 +45,12 @@
   <ItemGroup>
     <ProjectReference Include="..\TvAIrPlugin\TvAIrPlugin.csproj" Private="false" />
   </ItemGroup>
+
+  <!-- Developer-only analysis input: never built when Diagnostics is OFF. -->
+  <Target Name="BuildAIrConScopedLogExtractor" AfterTargets="Build"
+          Condition="'$(TvAIrDeveloperDiagnostics)' == 'true'">
+    <MSBuild Projects="$(MSBuildProjectDirectory)/../AIrCon.DevLogScope/AIrCon.DevLogScope.csproj"
+             Targets="Build"
+             Properties="Configuration=$(Configuration);Platform=$(Platform);TvAIrDeveloperDiagnostics=$(TvAIrDeveloperDiagnostics);TvAIrPublicRelease=$(TvAIrPublicRelease)" />
+  </Target>
 </Project>

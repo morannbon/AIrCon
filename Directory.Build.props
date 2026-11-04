@@ -11,8 +11,16 @@
     <TvAIrPluginHostContractName>plugin-host-foundation</TvAIrPluginHostContractName>
     <TvAIrPluginCompatibilityMajor>1</TvAIrPluginCompatibilityMajor>
     <TvAIrMinimumSupportedPluginHostContractVersion>1.0.0</TvAIrMinimumSupportedPluginHostContractVersion>
-    <!-- Developer Diagnostics build boundary. Public release source defaults OFF; development builds explicitly enable diagnostics. User operational logs remain enabled. -->
+    <!-- Single Developer Diagnostics authority for SDK, AIrCon and developer-only tools. -->
+    <TvAIrPublicRelease Condition="'$(TvAIrPublicRelease)' == ''">true</TvAIrPublicRelease>
     <TvAIrDeveloperDiagnostics Condition="'$(TvAIrDeveloperDiagnostics)' == ''">false</TvAIrDeveloperDiagnostics>
     <DefineConstants Condition="'$(TvAIrDeveloperDiagnostics)' == 'true'">$(DefineConstants);TVAIR_DEVELOPER_DIAGNOSTICS</DefineConstants>
   </PropertyGroup>
+  <!-- Never silently accept a legacy property that can diverge from the canonical gate. -->
+  <Target Name="ValidateDeveloperDiagnosticsBoundary" BeforeTargets="PrepareForBuild">
+    <Error Condition="'$(AIrConDeveloperDiagnostics)' != ''"
+           Text="AIrConDeveloperDiagnostics is obsolete. Use TvAIrDeveloperDiagnostics as the single build gate." />
+    <Error Condition="'$(TvAIrPublicRelease)' == 'true' and '$(TvAIrDeveloperDiagnostics)' != 'false'"
+           Text="Public release requires TvAIrDeveloperDiagnostics=false." />
+  </Target>
 </Project>
