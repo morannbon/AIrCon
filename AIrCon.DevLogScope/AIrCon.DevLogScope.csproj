@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <Platforms>AnyCPU;x86;x64</Platforms>
+    <IsPackable>false</IsPackable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <DefineConstants Condition="'$(TvAIrDeveloperDiagnostics)' == 'true'">$(DefineConstants);AIRCON_DEVELOPER_DIAGNOSTICS</DefineConstants>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Platform)' == 'x86'">
+    <PlatformTarget>x86</PlatformTarget>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Platform)' == 'x64'">
+    <PlatformTarget>x64</PlatformTarget>
+  </PropertyGroup>
+  <!-- The primary plugin's build invokes this project only with its canonical gate ON. -->
+  <ItemGroup Condition="'$(TvAIrDeveloperDiagnostics)' != 'true'">
+    <Compile Remove="Program.cs" />
+  </ItemGroup>
+  <Target Name="PreventDirectDiagnosticsOffBuild" BeforeTargets="CoreCompile"
+          Condition="'$(TvAIrDeveloperDiagnostics)' != 'true'">
+    <Error Text="AIrCon.DevLogScope is developer-only and is excluded when TvAIrDeveloperDiagnostics=false." />
+  </Target>
+  <!-- Developer x64 builds fail if the responsibility filter regression checks fail. -->
+  <Target Name="ValidateAIrConScopeFilter" AfterTargets="Build"
+          Condition="'$(TvAIrDeveloperDiagnostics)' == 'true' and '$(Platform)' == 'x64'">
+    <Exec Command="dotnet &quot;$(TargetPath)&quot; --self-test" />
+  </Target>
+</Project>

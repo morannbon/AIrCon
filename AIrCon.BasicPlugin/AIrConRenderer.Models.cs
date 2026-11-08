@@ -237,9 +237,7 @@ internal sealed partial class AIrConRenderer
     private sealed record WindowOperation(bool CanOpen, bool CanSelfRefresh, string WindowEndpoint, string WindowRoute, string WindowMethod, string WindowToken, string PluginId, string RouteSegment, string WindowId, bool ToolWindowSupported);
     private sealed record ViewerSessionRow(string LeaseId, string ServiceName, string ProgramGuideFilterGroup, string AllocationGroup, string TunerGroup, string TunerName, string Did, int SlotIndex, ushort? NetworkId, ushort? TransportStreamId, ushort? ServiceId, bool Current, string ViewerState, string ViewerProfile, string ViewerProfileName, string TvTestPathKey, string ViewerSessionId, long Generation, int? ProcessId)
     {
-        public bool IsActive => ProcessId is > 0
-            && !ViewerState.Equals("stopped", StringComparison.OrdinalIgnoreCase)
-            && !ViewerState.Equals("closed", StringComparison.OrdinalIgnoreCase);
+        public bool IsActive => IsViewerSessionActive(ProcessId, ViewerState);
     }
     private sealed record ViewerProfileChoice(string Value, string Name, bool Enabled, bool IsDefault, int Order, IReadOnlyList<string> AvailableGroups, int TvTestFrameIndex, string LogicalViewerSlotId, bool IsShared)
     {

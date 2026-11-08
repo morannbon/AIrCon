@@ -1,4 +1,4 @@
-AIrCon v1.0.10 - Third-party notices
+AIrCon v1.0.11 - Third-party notices
 
 TvAIr Plugin SDK 1.1.18 (Host Contract 1.1.18)
 Directory: TvAIrPlugin/

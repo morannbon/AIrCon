@@ -13,7 +13,7 @@ namespace AIrCon.BasicPlugin;
 /// </summary>
 internal sealed partial class AIrConRenderer
 {
-    internal const string PluginVersion = "1.0.10";
+    internal const string PluginVersion = "1.0.11";
     internal const string PluginListTitle = "AIrCon";
     internal static string PluginToolWindowTitle => $"{PluginListTitle} {PluginVersion}";
     internal const string PluginId = "aircon.basic";
@@ -44,12 +44,17 @@ internal sealed partial class AIrConRenderer
     internal const string SettingZappingIntervalSeconds = "zappingIntervalSeconds";
     internal const string SettingStartupWave = "startupWave";
     internal const int DefaultZappingIntervalSeconds = 60;
+    private const int DefaultPowerOffHours = 1;
+    private const int MaxPowerOffHours = 6;
     internal const string DefaultStartupWave = "GR";
     private static readonly int[] ZappingIntervals = { 30, 60, 90, 120, 180 };
     private static readonly string[] StartupWaves = { "GR", "BS", "CS", "CATV" };
 
     internal static int ValidateZappingInterval(int value) =>
         Array.IndexOf(ZappingIntervals, value) >= 0 ? value : DefaultZappingIntervalSeconds;
+
+    private static int ValidatePowerOffHours(int value) =>
+        value is >= DefaultPowerOffHours and <= MaxPowerOffHours ? value : DefaultPowerOffHours;
 
     // Tool-window layout metrics are centralized here.
     // The WinForms WebBrowser fallback is IE-like. Use only layout features already validated in this host;
@@ -662,7 +667,8 @@ internal sealed partial class AIrConRenderer
                     var sidText = PayloadValue(request, "serviceId", "service-id", "sid");
                     if (!int.TryParse(nidText, out var nid) || !int.TryParse(tsidText, out var tsid) || !int.TryParse(sidText, out var sid))
                         return new RuntimeUiActionResult { Succeeded = false, Message = "このチャンネルは現在視聴できません。", Diagnostics = "viewer_identity_invalid" };
-                    var tuned = await SwitchViewerServiceAsync(viewerProfile, wave, nid, tsid, sid, "manual_dblclick", TvAirViewerActivation.Activate).ConfigureAwait(false);
+                    var (tuned, zappingStopped) = await SwitchManualViewerServiceAsync(
+                        viewerProfile, wave, nid, tsid, sid).ConfigureAwait(false);
                     // ViewerSessionChanged is the sole display-update authority for both
                     // existing retunes and first launches. The event decides whether the
                     // current HTML needs one full render to enable Viewer controls.
@@ -682,7 +688,14 @@ internal sealed partial class AIrConRenderer
                         Diagnostics = tuned.Diagnostics,
                         RefreshRequested = false,
                         RefreshTarget = "content",
-                        PreserveScroll = true
+                        PreserveScroll = true,
+                        // Reuse the Stop button's canonical control/row projection.
+                        // The Host session event owns any changed station selection.
+                        // A repeat selection has no session event, so this also turns
+                        // its existing red row back to the normal viewing highlight.
+                        UiPatches = zappingStopped
+                            ? BuildZappingUiPatches(false, wave, windowId)
+                            : Array.Empty<RuntimeUiPatch>()
                     };
                 }
 
@@ -780,14 +793,15 @@ internal sealed partial class AIrConRenderer
                         Succeeded = true,
                         Message = "終了タイマー停止",
                         Diagnostics = "power_off_stopped",
-                        UiPatches = BuildPowerOffUiPatches(false, 1)
+                        UiPatches = BuildPowerOffUiPatches(false, DefaultPowerOffHours)
                     };
                 }
 
                 if (airconAction.Equals(AirConActionPowerOffStart, StringComparison.OrdinalIgnoreCase))
                 {
                     var hoursText = PayloadValue(request, "hours", "powerOffHours", "power-off-hours");
-                    if (!int.TryParse(hoursText, out var hours) || hours < 1 || hours > 6) hours = 1;
+                    var hours = ValidatePowerOffHours(int.TryParse(hoursText, out var requestedHours)
+                        ? requestedHours : DefaultPowerOffHours);
                     StartPowerOff(viewerProfile, hours, windowId);
                     #if AIRCON_DEVELOPER_DIAGNOSTICS
                     SafeLog($"POWER_OFF_TIMER started viewerProfile={viewerProfile} hours={hours}");

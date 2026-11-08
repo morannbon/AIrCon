@@ -26,13 +26,13 @@ if($spec.Name -eq 'TvAIr'){
 foreach($doc in @('README.md','README.txt','LICENSE')){Copy-Item -LiteralPath $doc -Destination $out}
 foreach($doc in @('THIRD_PARTY_NOTICES.txt','SDK_LICENSE.txt')){if(Test-Path -LiteralPath $doc){Copy-Item -LiteralPath $doc -Destination $out}}
 if($spec.Name -eq 'AI-rhythm'){Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'SDK_LICENSE.txt') -Destination $out}
-$instructions=if($spec.Name -eq 'TvAIr'){'ZIPを展開したフォルダー一式を配置してTvAIr.exeを起動してください。READMEの動作環境と初回設定に従ってください。'}else{"TvAIr v1.2.14と同じアーキテクチャを使用してください。TvAIrを終了し、$($spec.Dll)をTvAIr.exeと同じ場所のPluginsフォルダーへ配置してください。"}
+$instructions='TvAIr v1.2.14以上が必要です。TvAIrと同じアーキテクチャのZIPを使用してください。TvAIrを終了して AIrCon.BasicPlugin.dll をTvAIrの Plugins フォルダへ配置してください。'
 @"
 $($spec.Name) v$($spec.Version) ($Platform) - ビルド済み配布
 
 Visual Studioによるビルドは不要です。必要なランタイムと利用条件はREADMEをご確認ください。
 $instructions
-更新時はTvAIrを終了し、新しいファイルを今までのPluginsフォルダへ上書きしてください。設定ファイルはそのまま残ります。
+更新時はTvAIrを終了して新しいDLLを今までの Plugins フォルダへ上書きしてください。
 外部アプリやプラグインが必要な機能はREADMEの条件に従って設定してください。
 "@|Set-Content -LiteralPath (Join-Path $out 'INSTALL.txt') -Encoding utf8
 Compress-Archive -Path "$out/*" -DestinationPath "package/$($spec.Name)_v$($spec.Version)_$Platform.zip"

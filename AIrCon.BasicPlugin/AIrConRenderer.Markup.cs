@@ -331,7 +331,7 @@ body.aircon-runtime-root{position:static;}
     {
         if (sessions == null || sessions.Count == 0 || string.IsNullOrWhiteSpace(selectedViewerProfile)) return null;
         return sessions
-            .Where(x => !string.IsNullOrWhiteSpace(x.LeaseId))
+            .Where(x => x.IsActive && !string.IsNullOrWhiteSpace(x.LeaseId))
             .Where(x => x.ViewerProfile.Equals(selectedViewerProfile, StringComparison.OrdinalIgnoreCase))
             .OrderByDescending(x => x.IsActive)
             .ThenByDescending(x => x.Current)
@@ -426,42 +426,35 @@ body.aircon-runtime-root{position:static;}
             && !string.IsNullOrWhiteSpace(action.ActionToken)
             && !string.IsNullOrWhiteSpace(window.WindowId);
         var disabled = canPost ? string.Empty : " disabled=\"disabled\" aria-disabled=\"true\"";
-        var statusText = active ? "巡回中（" + NormalizeWaveFilter(activeWave) + "）" : "停止中";
-        var buttonText = active ? "停止" : "開始";
-        var title = active ? "ザッピングを停止" : GetZappingIntervalSeconds().ToString(System.Globalization.CultureInfo.InvariantCulture) + "秒ごとに同じ放送波内で順送りします";
-        var buttonClass = active ? "aircon-zapping-button aircon-zapping-button-on" : "aircon-zapping-button";
-        var statusClass = active ? "aircon-zapping-status aircon-zapping-status-on" : "aircon-zapping-status aircon-zapping-status-off";
-        var operation = active ? AirConActionZappingStop : AirConActionZappingStart;
+        var zapping = ResolveZappingControlPresentation(active, activeWave);
 
         var fields = new Dictionary<string, string?>
         {
-            ["operation"] = operation,
             ["wave"] = filter,
             ["viewerProfile"] = selectedViewerProfile,
             ["refreshQuery"] = "wave=" + filter + "&viewerProfile=" + selectedViewerProfile,
             ["clientVersion"] = ClientVersion
         };
 
-        var selectedSleepSession = viewerSessions.FirstOrDefault(s => s.ViewerProfile.Equals(selectedViewerProfile, StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(s.LeaseId));
+        var selectedSleepSession = ResolveSelectedProfileSession(viewerSessions, selectedViewerProfile);
         var sleepDisabled = selectedSleepSession == null ? " disabled=\"disabled\" aria-disabled=\"true\"" : string.Empty;
         var powerActive = powerOffDeadline.HasValue && powerOffDeadline.Value > DateTimeOffset.Now;
-        var remainingHours = powerActive ? Math.Max(1, (int)Math.Ceiling((powerOffDeadline!.Value - DateTimeOffset.Now).TotalHours)) : 1;
-        var powerOperation = powerActive ? AirConActionPowerOffStop : AirConActionPowerOffStart;
-        var powerFields = new Dictionary<string, string?>(fields)
-        {
-            ["refreshQuery"] = "wave=" + filter + "&viewerProfile=" + selectedViewerProfile
-        };
-
-        return "<div id=\"aircon-zapping-bar\" class=\"aircon-zapping-bar\" data-aircon-zapping-wave=\"" + HtmlAttr(filter) + "\" data-aircon-zapping-profile=\"" + HtmlAttr(selectedViewerProfile) + "\" data-aircon-zapping-window=\"" + HtmlAttr(window.WindowId) + "\" data-aircon-zapping-active=\"" + (active ? BoolTrue : BoolFalse) + "\">"
+        var remainingHours = powerActive ? Math.Max(DefaultPowerOffHours, (int)Math.Ceiling((powerOffDeadline!.Value - DateTimeOffset.Now).TotalHours)) : 1;
+        var power = ResolvePowerOffControlPresentation(powerActive, remainingHours);
+        var hourOptions = string.Concat(Enumerable.Range(DefaultPowerOffHours, MaxPowerOffHours - DefaultPowerOffHours + 1)
+            .Select(hour => $"<option value=\"{hour}\">{hour}h</option>"));
+        // Both controls remain one ordinary row AFTER the station rows; they never
+        // consume permanent window height. Actions update only these existing IDs.
+        return "<div id=\"aircon-zapping-bar\" class=\"aircon-zapping-bar\" data-aircon-zapping-wave=\"" + HtmlAttr(filter) + "\" data-aircon-zapping-profile=\"" + HtmlAttr(selectedViewerProfile) + "\" data-aircon-zapping-window=\"" + HtmlAttr(window.WindowId) + "\" data-aircon-zapping-active=\"" + (zapping.Active ? BoolTrue : BoolFalse) + "\">"
             + "<div class=\"aircon-zapping-left\">"
             + "<span class=\"aircon-zapping-label\">ザッピング</span>"
-            + "<span id=\"aircon-zapping-status\" class=\"" + statusClass + "\">" + Html(statusText) + "</span>"
-            + "<button id=\"aircon-zapping-button\" class=\"" + buttonClass + "\" type=\"button\" " + BuildHostActionAttributes(context, new Dictionary<string, string?>(fields) { ["operation"] = operation, ["airconAction"] = operation }, "click", "patchWindow") + " title=\"" + HtmlAttr(title) + "\"" + disabled + ">" + Html(buttonText) + "</button></div>"
+            + "<span id=\"aircon-zapping-status\" class=\"aircon-zapping-status " + zapping.StatusClass + "\">" + Html(zapping.StatusText) + "</span>"
+            + "<button id=\"aircon-zapping-button\" class=\"aircon-zapping-button" + (zapping.Active ? " aircon-zapping-button-on" : string.Empty) + "\" type=\"button\" " + BuildHostActionAttributes(context, new Dictionary<string, string?>(fields) { ["operation"] = zapping.NextOperation, ["airconAction"] = zapping.NextOperation }, "click", ResponseModeHostHandled) + " title=\"" + HtmlAttr(zapping.ButtonTitle) + "\"" + disabled + "><span id=\"aircon-zapping-button-label\">" + Html(zapping.ButtonText) + "</span></button></div>"
             + "<form id=\"aircon-sleep-form\" class=\"aircon-sleep-right aircon-sleep-form\">"
-            + "<span id=\"aircon-sleep-label\" class=\"aircon-sleep-label\">" + (powerActive ? "終了まで" : "電源OFF") + "</span>"
-            + "<select id=\"aircon-sleep-select\" name=\"hours\" class=\"aircon-sleep-select\" aria-label=\"終了タイマー\" title=\"終了タイマー\"" + (powerActive ? " hidden=\"hidden\"" : string.Empty) + "><option value=\"1\">1h</option><option value=\"2\">2h</option><option value=\"3\">3h</option><option value=\"4\">4h</option><option value=\"5\">5h</option><option value=\"6\">6h</option></select>"
-            + "<span id=\"aircon-sleep-remaining\" class=\"aircon-sleep-remaining\"" + (powerActive ? string.Empty : " hidden=\"hidden\"") + ">" + remainingHours.ToString(System.Globalization.CultureInfo.InvariantCulture) + "h</span>"
-            + "<button id=\"aircon-sleep-button\" class=\"aircon-sleep-button" + (powerActive ? " aircon-sleep-button-on" : string.Empty) + "\" type=\"button\" " + BuildHostActionAttributes(context, new Dictionary<string, string?>(powerFields) { ["operation"] = powerOperation }, "click", "patchWindow", "closestForm") + " title=\"" + (powerActive ? "終了タイマーを停止" : "選択中TVTestの終了タイマーを開始") + "\"" + sleepDisabled + ">" + (powerActive ? "停止" : "開始") + "</button>"
+            + "<span id=\"aircon-sleep-label\" class=\"aircon-sleep-label\">" + Html(power.Label) + "</span>"
+            + "<select id=\"aircon-sleep-select\" name=\"hours\" class=\"aircon-sleep-select\" aria-label=\"終了タイマー\" title=\"終了タイマー\"" + (power.Active ? " hidden=\"hidden\"" : string.Empty) + ">" + hourOptions + "</select>"
+            + "<span id=\"aircon-sleep-remaining\" class=\"aircon-sleep-remaining\"" + (power.Active ? string.Empty : " hidden=\"hidden\"") + ">" + power.Hours.ToString(System.Globalization.CultureInfo.InvariantCulture) + "h</span>"
+            + "<button id=\"aircon-sleep-button\" class=\"aircon-sleep-button" + (power.Active ? " aircon-sleep-button-on" : string.Empty) + "\" type=\"button\" " + BuildHostActionAttributes(context, new Dictionary<string, string?>(fields) { ["operation"] = power.NextOperation }, "click", ResponseModeHostHandled, "closestForm") + " title=\"" + HtmlAttr(power.ButtonTitle) + "\"" + sleepDisabled + "><span id=\"aircon-sleep-button-label\">" + Html(power.ButtonText) + "</span></button>"
             + "</form></div>";
     }
 

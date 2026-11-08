@@ -87,11 +87,27 @@ internal sealed partial class AIrConRenderer
         }
     }
 
+    // Both the Stop button and a manual station choice use this one cancellation
+    // boundary. The zapping state and its operation generation change under the
+    // same lock as EnsureZappingActive, independent of the displayed wave.
+    private bool CancelActiveZapping(string viewerProfile, bool supersedePendingOperation = false)
+    {
+        var key = BuildZappingKey(viewerProfile);
+        lock (_zappingLock)
+        {
+            var wasActive = _zappingStates.TryGetValue(key, out var state) && state.Active;
+            if (!wasActive && !supersedePendingOperation)
+                return false;
+            NextOperationGeneration(viewerProfile);
+            RemoveZappingState(viewerProfile);
+            return wasActive;
+        }
+    }
+
     private async Task StopZappingAsync(string viewerProfile)
     {
         if (_runtimeUiStopped) return;
-        NextOperationGeneration(viewerProfile);
-        RemoveZappingState(viewerProfile);
+        CancelActiveZapping(viewerProfile);
 
         // Drain any dispatch already in flight. The gate lease survives runtime
         // retirement, and a queued old tick still fails its generation check.
@@ -100,13 +116,20 @@ internal sealed partial class AIrConRenderer
         gate.Release();
     }
 
-    private void RemoveZappingState(string viewerProfile)
+    // A tick may complete after manual selection revoked its generation. It must
+    // not remove a newer zapping cycle started while that old dispatch was draining.
+    private bool RemoveZappingState(string viewerProfile, long? expectedGeneration = null)
     {
         var key = BuildZappingKey(viewerProfile);
         lock (_zappingLock)
         {
-            _zappingStates.Remove(key);
+            if (expectedGeneration.HasValue &&
+                (!_zappingStates.TryGetValue(key, out var current) ||
+                 current.Generation != expectedGeneration.Value))
+                return false;
+            var removed = _zappingStates.Remove(key);
             RemoveAndDisposeTimer(_zappingTimers, key);
+            return removed;
         }
     }
 
@@ -124,7 +147,7 @@ internal sealed partial class AIrConRenderer
     }
 
     private async Task RunZappingTickAsync(
-        string viewerProfile, long? expectedGeneration, string source, long? expectedLifecycleVersion = null)
+        string viewerProfile, long expectedGeneration, string source, long? expectedLifecycleVersion = null)
     {
         if (_runtimeUiStopped) return;
         var lifecycleVersion = expectedLifecycleVersion ?? CaptureRuntimeUiLifecycle();
@@ -141,7 +164,7 @@ internal sealed partial class AIrConRenderer
             lock (_zappingLock)
             {
                 if (!_zappingStates.TryGetValue(key, out state!) || !state.Active ||
-                    (expectedGeneration.HasValue && state.Generation != expectedGeneration.Value) ||
+                    state.Generation != expectedGeneration ||
                     state.Generation != CurrentOperationGeneration(viewerProfile))
                 {
                     #if AIRCON_DEVELOPER_DIAGNOSTICS
@@ -164,10 +187,12 @@ internal sealed partial class AIrConRenderer
                 !liveSession.ViewerProfileId.Equals(viewerProfile, StringComparison.Ordinal) ||
                 liveSession.ProcessId != state.ProcessId || liveSession.Generation <= 0)
             {
-                RemoveZappingState(viewerProfile);
-                #if AIRCON_DEVELOPER_DIAGNOSTICS
-                SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=viewer_identity_changed expectedSession={state.ViewerSessionId} expectedPid={state.ProcessId}");
-                #endif
+                if (RemoveZappingState(viewerProfile, expectedGeneration))
+                {
+                    #if AIRCON_DEVELOPER_DIAGNOSTICS
+                    SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=viewer_identity_changed expectedSession={state.ViewerSessionId} expectedPid={state.ProcessId}");
+                    #endif
+                }
                 return;
             }
 
@@ -182,10 +207,13 @@ internal sealed partial class AIrConRenderer
                     : string.Empty;
                 if (!NormalizeWaveFilter(currentWave).Equals(wave, StringComparison.OrdinalIgnoreCase))
                 {
-                    RemoveZappingState(viewerProfile);
-                    #if AIRCON_DEVELOPER_DIAGNOSTICS
-                    SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=viewer_wave_changed expectedWave={wave} actualWave={currentWave}");
-                    #endif
+                    if (RemoveZappingState(viewerProfile, expectedGeneration))
+                    {
+                        #if AIRCON_DEVELOPER_DIAGNOSTICS
+                        SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=viewer_wave_changed expectedWave={wave} actualWave={currentWave}");
+
+                        #endif
+                    }
                     return;
                 }
                 var currentKey = ServiceKey(current!.NetworkId, current.TransportStreamId, current.ServiceId);
@@ -211,10 +239,12 @@ internal sealed partial class AIrConRenderer
                 #if AIRCON_DEVELOPER_DIAGNOSTICS
                 SafeLog($"ZAPPING_TICK failed reason=no_services windowId={windowId} wave={wave} viewerProfile={viewerProfile} source={source}");
                 #endif
-                RemoveZappingState(viewerProfile);
-                #if AIRCON_DEVELOPER_DIAGNOSTICS
-                SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=no_services");
-                #endif
+                if (RemoveZappingState(viewerProfile, expectedGeneration))
+                {
+                    #if AIRCON_DEVELOPER_DIAGNOSTICS
+                    SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=no_services");
+                    #endif
+                }
                 return;
             }
 
@@ -264,10 +294,13 @@ internal sealed partial class AIrConRenderer
                 var replacement = FindActiveViewerSession(viewerProfile);
                 if (replacement == null || string.IsNullOrWhiteSpace(replacement.ViewerSessionId) || replacement.ProcessId.GetValueOrDefault() <= 0)
                 {
-                    RemoveZappingState(viewerProfile);
-                    #if AIRCON_DEVELOPER_DIAGNOSTICS
-                    SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=replacement_identity_missing");
-                    #endif
+                    if (RemoveZappingState(viewerProfile, expectedGeneration))
+                    {
+                        #if AIRCON_DEVELOPER_DIAGNOSTICS
+                        SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=replacement_identity_missing");
+
+                        #endif
+                    }
                     return;
                 }
                 var replacementProcessId = replacement.ProcessId.GetValueOrDefault();
@@ -275,10 +308,12 @@ internal sealed partial class AIrConRenderer
             }
             else
             {
-                RemoveZappingState(viewerProfile);
-                #if AIRCON_DEVELOPER_DIAGNOSTICS
-                SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=switch_failed diagnostics={result.Diagnostics}");
-                #endif
+                if (RemoveZappingState(viewerProfile, expectedGeneration))
+                {
+                    #if AIRCON_DEVELOPER_DIAGNOSTICS
+                    SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=switch_failed diagnostics={result.Diagnostics}");
+                    #endif
+                }
             }
 
             #if AIRCON_DEVELOPER_DIAGNOSTICS
@@ -299,11 +334,13 @@ internal sealed partial class AIrConRenderer
 #endif
         {
             // A superseded lifecycle cannot remove a new lifecycle's zapping state.
-            if (IsCurrentRuntimeUiLifecycle(lifecycleVersion))
-                RemoveZappingState(viewerProfile);
-            #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=tick_exception");
-            #endif
+            if (IsCurrentRuntimeUiLifecycle(lifecycleVersion) &&
+                RemoveZappingState(viewerProfile, expectedGeneration))
+            {
+                #if AIRCON_DEVELOPER_DIAGNOSTICS
+                SafeLog($"ZAPPING_STATE stopped viewerProfile={viewerProfile} reason=tick_exception");
+                #endif
+            }
             #if AIRCON_DEVELOPER_DIAGNOSTICS
             SafeLog($"ZAPPING_TICK failed viewerProfile={viewerProfile} source={source} exception={ex.GetType().Name} message={ex.Message}");
             #endif
@@ -556,8 +593,7 @@ internal sealed partial class AIrConRenderer
         if (_runtimeUiStopped)
             return HostActionDispatchResult.Failure("runtime_stopped", "AIrCon is stopped.");
         var lifecycleVersion = CaptureRuntimeUiLifecycle();
-        var generation = NextOperationGeneration(viewerProfile);
-        RemoveZappingState(viewerProfile);
+        CancelActiveZapping(viewerProfile, supersedePendingOperation: true);
         SetPowerOffStopped(viewerProfile);
 
         using var gate = GetProfileOperationGate(viewerProfile);
@@ -568,14 +604,14 @@ internal sealed partial class AIrConRenderer
                 return HostActionDispatchResult.Failure("runtime_stopped", "AIrCon is stopped.");
             var result = await DispatchViewerStopForProfileAsync(viewerProfile, origin).ConfigureAwait(false);
             #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog($"COMPLETE_SHUTDOWN viewerProfile={viewerProfile} operationGeneration={generation} origin={origin} result={(result.Success ? "OK" : "FAILED")} message={result.Message}");
+            SafeLog($"COMPLETE_SHUTDOWN viewerProfile={viewerProfile} origin={origin} result={(result.Success ? "OK" : "FAILED")} message={result.Message}");
             #endif
             return result;
         }
         catch (Exception ex)
         {
             #if AIRCON_DEVELOPER_DIAGNOSTICS
-            SafeLog($"COMPLETE_SHUTDOWN failed viewerProfile={viewerProfile} operationGeneration={generation} origin={origin} exception={ex.GetType().Name} message={ex.Message}");
+            SafeLog($"COMPLETE_SHUTDOWN failed viewerProfile={viewerProfile} origin={origin} exception={ex.GetType().Name} message={ex.Message}");
             #endif
             return HostActionDispatchResult.Failure("viewer_stop_exception", ex.Message);
         }

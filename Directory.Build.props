@@ -12,8 +12,7 @@
     <TvAIrPluginCompatibilityMajor>1</TvAIrPluginCompatibilityMajor>
     <TvAIrMinimumSupportedPluginHostContractVersion>1.0.0</TvAIrMinimumSupportedPluginHostContractVersion>
     <!-- Single Developer Diagnostics authority for SDK, AIrCon and developer-only tools. -->
-    <TvAIrPublicRelease Condition="'$(TvAIrPublicRelease)' == ''">true</TvAIrPublicRelease>
-    <TvAIrDeveloperDiagnostics Condition="'$(TvAIrDeveloperDiagnostics)' == ''">false</TvAIrDeveloperDiagnostics>
+    <TvAIrDeveloperDiagnostics Condition="'$(TvAIrDeveloperDiagnostics)' == ''">true</TvAIrDeveloperDiagnostics>
     <DefineConstants Condition="'$(TvAIrDeveloperDiagnostics)' == 'true'">$(DefineConstants);TVAIR_DEVELOPER_DIAGNOSTICS</DefineConstants>
   </PropertyGroup>
   <!-- Never silently accept a legacy property that can diverge from the canonical gate. -->

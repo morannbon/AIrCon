@@ -8,18 +8,28 @@ namespace AIrCon.BasicPlugin;
 
 internal sealed partial class AIrConRenderer
 {
-    private async Task<AIrConNewApiBridge.OperationResult> SwitchViewerServiceAsync(string viewerProfile, string wave, int networkId, int transportStreamId, int serviceId, string source, string viewerActivation)
+    // A station double-click is an explicit Viewer choice on every broadcast wave.
+    // Revoke only an active zapping cycle before entering the same per-profile gate
+    // used by automatic ticks. An already dispatched tick drains first; a queued
+    // obsolete tick fails its generation check. No extra Viewer action is required
+    // when zapping was not active.
+    private async Task<(AIrConNewApiBridge.OperationResult Tune, bool ZappingStopped)> SwitchManualViewerServiceAsync(
+        string viewerProfile, string wave, int networkId, int transportStreamId, int serviceId)
     {
         if (_runtimeUiStopped)
-            return AIrConNewApiBridge.OperationResult.Fail("runtime_stopped", "AIrCon is stopped.");
+            return (AIrConNewApiBridge.OperationResult.Fail("runtime_stopped", "AIrCon is stopped."), false);
         var lifecycleVersion = CaptureRuntimeUiLifecycle();
+        var zappingStopped = CancelActiveZapping(viewerProfile);
         using var gate = GetProfileOperationGate(viewerProfile);
         await gate.WaitAsync().ConfigureAwait(false);
         try
         {
             if (!IsCurrentRuntimeUiLifecycle(lifecycleVersion))
-                return AIrConNewApiBridge.OperationResult.Fail("runtime_stopped", "AIrCon is stopped.");
-            return await SwitchViewerServiceCoreAsync(viewerProfile, wave, networkId, transportStreamId, serviceId, source, viewerActivation, null).ConfigureAwait(false);
+                return (AIrConNewApiBridge.OperationResult.Fail("runtime_stopped", "AIrCon is stopped."), zappingStopped);
+            var tuned = await SwitchViewerServiceCoreAsync(
+                viewerProfile, wave, networkId, transportStreamId, serviceId,
+                "manual_dblclick", TvAirViewerActivation.Activate, null).ConfigureAwait(false);
+            return (tuned, zappingStopped);
         }
         finally
         {
@@ -223,8 +233,7 @@ internal sealed partial class AIrConRenderer
     {
         // One profile-scoped boundary for every Host-owned explicit Viewer Operation.
         // Reservation code does not know individual automation features.
-        NextOperationGeneration(viewerProfile);
-        RemoveZappingState(viewerProfile);
+        CancelActiveZapping(viewerProfile, supersedePendingOperation: true);
         SetPowerOffStopped(viewerProfile);
     }
 
@@ -541,8 +550,7 @@ internal sealed partial class AIrConRenderer
             var patches = new List<RuntimeUiPatch>
             {
                 RuntimeUiPatch.Enabled("aircon-viewer-power-button", false),
-                RuntimeUiPatch.Classes(
-                    "aircon-viewer-power-button",
+                RuntimeUiPatch.Classes("aircon-viewer-power-button",
                     add: new[] { "aircon-toolbar-button-disabled" },
                     remove: Array.Empty<string>()),
                 new RuntimeUiPatch
@@ -553,23 +561,22 @@ internal sealed partial class AIrConRenderer
                         ["aria-disabled"] = "true",
                         ["title"] = "選択中のTVTestは停止済みです"
                     }
-                },
-                RuntimeUiPatch.Text("aircon-zapping-status", "停止中"),
-                RuntimeUiPatch.Classes("aircon-zapping-status",
-                    add: new[] { "aircon-zapping-status-off" },
-                    remove: new[] { "aircon-zapping-status-on" }),
-                RuntimeUiPatch.Text("aircon-zapping-button", "開始"),
-                RuntimeUiPatch.Classes("aircon-zapping-button",
-                    add: Array.Empty<string>(),
-                    remove: new[] { "aircon-zapping-button-on" }),
-                RuntimeUiPatch.Text("aircon-sleep-label", "電源OFF"),
-                RuntimeUiPatch.Visibility("aircon-sleep-select", visible: true),
-                RuntimeUiPatch.Visibility("aircon-sleep-remaining", visible: false),
-                RuntimeUiPatch.Text("aircon-sleep-button", "開始"),
-                RuntimeUiPatch.Classes("aircon-sleep-button",
-                    add: Array.Empty<string>(),
-                    remove: new[] { "aircon-sleep-button-on" })
+                }
             };
+            // Terminal and button actions share exactly the same control projection.
+            // The terminal event additionally revokes the stopped viewer's timer action.
+            patches.AddRange(BuildZappingControlPatches(ResolveZappingControlPresentation(false, pair.Value.Wave)));
+            patches.AddRange(BuildPowerOffUiPatches(false, DefaultPowerOffHours));
+            patches.Add(RuntimeUiPatch.Enabled("aircon-sleep-button", false));
+            patches.Add(new RuntimeUiPatch
+            {
+                ElementId = "aircon-sleep-button",
+                Attributes = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["aria-disabled"] = "true",
+                    ["title"] = "選択中のTVTestは停止済みです"
+                }
+            });
 
             var displayedWave = pair.Value.Wave;
 
