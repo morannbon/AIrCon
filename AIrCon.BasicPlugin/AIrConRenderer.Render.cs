@@ -15,6 +15,7 @@ internal sealed partial class AIrConRenderer
             var isToolWindow = IsToolWindow(context);
             var query = ExtractQueryDictionary(context);
             var requestedWave = QueryString(query, "wave");
+            var waveNavigation = isToolWindow && QueryString(query, "waveNavigation") == "1";
             var requestedView = QueryString(query, "view");
             var windowIdForWave = QueryWindowId(context);
             if (isToolWindow) PruneSupersededWindowState(windowIdForWave);
@@ -50,14 +51,21 @@ internal sealed partial class AIrConRenderer
             var viewerProfiles = CaptureViewerProfiles(context);
             var requestedViewerProfile = FirstNonEmpty(programGuideInitialProfile, ResolveRequestedViewerProfile(query, windowIdForWave));
             var focusTriplet = new FocusTriplet(null, null, null);
-            var data = CaptureData(filter, viewerProfiles, focusTriplet);
+            var data = CaptureData(filter, viewerProfiles, focusTriplet, waveNavigation);
             // A saved wave may no longer have any configured service. Select a visible
             // wave from the same Host channel snapshot; never infer reception from tuners.
             var visibleWaves = CanonicalWaveFilters(data.WaveFilters);
             if (visibleWaves.Count > 0 && !visibleWaves.Any(x => x.Group.Equals(filter, StringComparison.OrdinalIgnoreCase)))
             {
                 filter = visibleWaves[0].Group;
-                data = CaptureData(filter, viewerProfiles, focusTriplet);
+                // The Host channel snapshot is one authority per render. A wave
+                // fallback must never repeat EPG acquisition or session reads.
+                data = data with
+                {
+                    Services = data.AllServices.Where(row =>
+                        row.ProgramGuideFilterGroup.Equals(filter, StringComparison.OrdinalIgnoreCase))
+                        .OrderBy(row => row.ProgramGuideOrder).ToList()
+                };
             }
             // Resolve all viewer-scoped state only against the final visible wave.
             // The fallback wave may have a different profile and active timer.

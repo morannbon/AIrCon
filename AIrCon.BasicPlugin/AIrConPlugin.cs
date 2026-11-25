@@ -13,7 +13,7 @@ namespace AIrCon.BasicPlugin;
 /// </summary>
 internal sealed partial class AIrConRenderer
 {
-    internal const string PluginVersion = "1.0.11";
+    internal const string PluginVersion = "1.0.12";
     internal const string PluginListTitle = "AIrCon";
     internal static string PluginToolWindowTitle => $"{PluginListTitle} {PluginVersion}";
     internal const string PluginId = "aircon.basic";
@@ -181,7 +181,10 @@ internal sealed partial class AIrConRenderer
             displayed.Wave.Equals(wave, StringComparison.OrdinalIgnoreCase) &&
             displayed.ViewerProfile.Equals(viewerProfile, StringComparison.OrdinalIgnoreCase))
             return AIrConNewApiBridge.OperationResult.Ok("wave_already_displayed");
-        return RequestWindowDisplayNavigation(windowId, wave, viewerProfile);
+        // One canonical navigation route identifies list browsing. RenderHtml
+        // must not load ProgramGuide synchronously for this action.
+        return RequestWindowDisplayNavigation(windowId, wave, viewerProfile,
+            BuildViewerContentRoute(wave, viewerProfile, waveNavigation: true));
     }
 
     private void SetRenderedService(string windowId, string serviceKey)

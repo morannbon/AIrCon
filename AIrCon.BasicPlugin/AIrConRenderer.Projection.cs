@@ -249,7 +249,7 @@ internal sealed partial class AIrConRenderer
             .ToList();
     }
 
-    private FloatingViewerData CaptureData(string filter, ViewerProfileState viewerProfiles, FocusTriplet focusTriplet)
+    private FloatingViewerData CaptureData(string filter, ViewerProfileState viewerProfiles, FocusTriplet focusTriplet, bool waveNavigation)
     {
         var services = new List<ServiceRow>();
         var sessions = new List<ViewerSessionRow>();
@@ -292,7 +292,7 @@ internal sealed partial class AIrConRenderer
 #endif
 
             var now = DateTimeOffset.Now;
-            programEvents = AIrConNewApiBridge.ListProgramEvents(now, now.AddHours(6)).ToList();
+            programEvents = AIrConNewApiBridge.ListProgramEvents(now, now.AddHours(6), waveNavigation).ToList();
             ApplyRuntimeNowNext(services, programEvents, now);
             projectionUsed = true;
 #if AIRCON_DEVELOPER_DIAGNOSTICS
@@ -394,7 +394,7 @@ services = NormalizeViewerServiceAuthority(services);
 
         var serviceColumnWidth = CalculateServiceColumnWidth(services);
 
-        return new FloatingViewerData(filtered, sessions, tuners, waveFilters, viewerProfiles, programEvents, viewerReservations, projectionUsed, safeEventContractAvailable, safeDblclickEvents, serviceColumnWidth);
+        return new FloatingViewerData(filtered, sessions, tuners, waveFilters, viewerProfiles, programEvents, viewerReservations, projectionUsed, safeEventContractAvailable, safeDblclickEvents, serviceColumnWidth, services);
     }
 
     private static List<ServiceRow> NormalizeViewerServiceAuthority(IReadOnlyList<ServiceRow> source)

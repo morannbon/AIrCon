@@ -19,6 +19,14 @@ internal static class AIrConNewApiBridge
     private static DateTimeOffset _programProjectionFrom;
     private static DateTimeOffset _programProjectionTo;
     private static DateTimeOffset _programProjectionExpiresAt;
+    // All ProgramGuide reads use this single-flight owner. Wave browsing consumes the
+    // last committed immutable snapshot without waiting for a Host EPG query.
+    // Neither the slow Host call nor the pending Task holds Sync.
+    private static Task? _programProjectionRefreshTask;
+    private static long _programProjectionRevision;
+    private static long _programProjectionTaskRevision;
+    private static DateTimeOffset _programProjectionRetryAfter;
+    private static readonly TimeSpan ProgramProjectionRetryInterval = TimeSpan.FromSeconds(30);
 
     internal static void InitializeRuntime(ITvAirPluginRuntimeContext context)
     {
@@ -100,10 +108,11 @@ internal static class AIrConNewApiBridge
     {
         lock (Sync)
         {
-            _programProjection = null;
-            _programProjectionFrom = default;
-            _programProjectionTo = default;
+            // Keep the last committed data as a display fallback. A wave switch
+            // must not synchronously refetch EPG merely because it was invalidated.
+            _programProjectionRevision++;
             _programProjectionExpiresAt = default;
+            _programProjectionRetryAfter = default;
         }
     }
 
@@ -117,6 +126,10 @@ internal static class AIrConNewApiBridge
         _programProjectionFrom = default;
         _programProjectionTo = default;
         _programProjectionExpiresAt = default;
+        _programProjectionRefreshTask = null;
+        _programProjectionRevision++;
+        _programProjectionTaskRevision = 0;
+        _programProjectionRetryAfter = default;
     }
 #if AIRCON_DEVELOPER_DIAGNOSTICS
     internal static void LogInfo(string message)
@@ -352,53 +365,122 @@ internal static class AIrConNewApiBridge
         }
     }
 
-    internal static IReadOnlyList<TvAirProgramEventDto> ListProgramEvents(DateTimeOffset from, DateTimeOffset to)
+    // One projection owner serves ordinary renders and wave navigation alike.
+    // Browsing an already available list cannot become dependent on a long Host
+    // EPG merge, including when the cache expires or ProgramGuideUpdated fires.
+    internal static IReadOnlyList<TvAirProgramEventDto> ListProgramEvents(
+        DateTimeOffset from, DateTimeOffset to, bool waveNavigation = false)
     {
+        Task? refresh = null;
+        TvAirProgramEventDto[] snapshot;
         lock (Sync)
         {
             var now = DateTimeOffset.Now;
-            var cacheValid = _programProjection != null
-                && now < _programProjectionExpiresAt
-                && from >= _programProjectionFrom
-                && to <= _programProjectionTo;
-            if (!cacheValid)
+            var current = ProgramProjectionCoversLocked(from, to)
+                && now < _programProjectionExpiresAt;
+            if (!current && now >= _programProjectionRetryAfter)
+                refresh = EnsureProgramProjectionRefreshLocked(from, to);
+
+            // Wave browsing is strictly read-only with respect to the current UI:
+            // start at most one bounded background revalidation and render from the
+            // last completed projection. A pending Host call is never awaited here.
+            if (waveNavigation || current || refresh == null)
             {
-                // RenderHtml asks for [now, now+6h]. Cache a deliberate superset so
-                // the next render's slightly advanced upper bound remains covered.
-                // Freshness is owned by ProgramGuideUpdated and the nearest programme
-                // boundary, not by comparing two independently sampled now values.
-                var queryFrom = from.AddMinutes(-1);
-                var queryTo = to.AddMinutes(10);
-                _programProjection = _runtimeContext?.ProgramGuide.ListEvents(new TvAirProgramGuideQueryDto
+                snapshot = _programProjection ?? Array.Empty<TvAirProgramEventDto>();
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+                LogProgramProjection(current ? "HIT" : waveNavigation ? "STALE_NONBLOCKING" : "STALE_RETRY", snapshot.Length,
+                    _programProjectionFrom, _programProjectionTo, _programProjectionExpiresAt);
+#endif
+                return FilterProgramProjection(snapshot, from, to);
+            }
+        }
+
+        // Initial display and explicit Refresh can request fresh data. The same
+        // single-flight owns the result and commits it after the Host call exits.
+        // No bridge-wide lock is held while waiting on the external API.
+        try { refresh.GetAwaiter().GetResult(); }
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+        catch (Exception ex) { LogInfo("PROGRAM_NOW_NEXT_PROJECTION result=FAILED reason=" + ex.GetType().Name); }
+#else
+        catch (Exception) { }
+#endif
+        lock (Sync)
+        {
+            snapshot = _programProjection ?? Array.Empty<TvAirProgramEventDto>();
+            return FilterProgramProjection(snapshot, from, to);
+        }
+    }
+
+    private static bool ProgramProjectionCoversLocked(DateTimeOffset from, DateTimeOffset to) =>
+        _programProjection != null && from >= _programProjectionFrom && to <= _programProjectionTo;
+
+    private static TvAirProgramEventDto[] FilterProgramProjection(
+        IReadOnlyList<TvAirProgramEventDto> source, DateTimeOffset from, DateTimeOffset to) =>
+        source.Where(x => x.End > from && x.Start < to).ToArray();
+
+    private static Task? EnsureProgramProjectionRefreshLocked(DateTimeOffset from, DateTimeOffset to)
+    {
+        if (_programProjectionRefreshTask is { IsCompleted: false } pending) return pending;
+        var context = _runtimeContext;
+        if (context == null) return null;
+        var revision = _programProjectionRevision;
+        var queryFrom = from.AddMinutes(-1);
+        var queryTo = to.AddMinutes(10);
+        _programProjectionTaskRevision = revision;
+        _programProjectionRefreshTask = Task.Run(() =>
+        {
+            try
+            {
+                // The Host's ListEvents can spend seconds merging EPG. Never hold
+                // Sync here; channel, session and wave operations remain independent.
+                var fetched = context.ProgramGuide.ListEvents(new TvAirProgramGuideQueryDto
                 {
                     From = queryFrom,
                     To = queryTo,
                     Limit = 20000
-                }).ToArray() ?? Array.Empty<TvAirProgramEventDto>();
-                _programProjectionFrom = queryFrom;
-                _programProjectionTo = queryTo;
-
-                var nextBoundary = _programProjection
+                }).ToArray();
+                var now = DateTimeOffset.Now;
+                var nextBoundary = fetched
                     .Where(x => x.Start <= now && x.End > now)
                     .Select(x => x.End)
                     .DefaultIfEmpty(now.AddMinutes(5))
                     .Min();
-                var safetyExpiry = now.AddMinutes(5);
-                _programProjectionExpiresAt = nextBoundary < safetyExpiry ? nextBoundary : safetyExpiry;
-                #if AIRCON_DEVELOPER_DIAGNOSTICS
-                LogProgramProjection("MISS", _programProjection.Length, queryFrom, queryTo, _programProjectionExpiresAt);
-                #endif
+                var expiresAt = nextBoundary < now.AddMinutes(5) ? nextBoundary : now.AddMinutes(5);
+                lock (Sync)
+                {
+                    // Lifecycle and invalidation generation are the only commit
+                    // authority. A previous Host response cannot revive stale data.
+                    if (!ReferenceEquals(context, _runtimeContext) || revision != _programProjectionRevision)
+                        return;
+                    _programProjection = fetched;
+                    _programProjectionFrom = queryFrom;
+                    _programProjectionTo = queryTo;
+                    _programProjectionExpiresAt = expiresAt;
+                    _programProjectionRetryAfter = default;
+#if AIRCON_DEVELOPER_DIAGNOSTICS
+                    LogProgramProjection("MISS", fetched.Length, queryFrom, queryTo, expiresAt);
+#endif
+                }
             }
-            else
+            catch (Exception)
             {
-                #if AIRCON_DEVELOPER_DIAGNOSTICS
-                LogProgramProjection("HIT", _programProjection!.Length, _programProjectionFrom, _programProjectionTo, _programProjectionExpiresAt);
-                #endif
+                lock (Sync)
+                {
+                    if (ReferenceEquals(context, _runtimeContext) && revision == _programProjectionRevision)
+                        _programProjectionRetryAfter = DateTimeOffset.Now.Add(ProgramProjectionRetryInterval);
+                }
+                // The last good snapshot remains usable. Retry is throttled.
             }
-            return _programProjection!
-                .Where(x => x.End > from && x.Start < to)
-                .ToArray();
-        }
+            finally
+            {
+                lock (Sync)
+                {
+                    if (_programProjectionTaskRevision == revision)
+                        _programProjectionRefreshTask = null;
+                }
+            }
+        });
+        return _programProjectionRefreshTask;
     }
 
     internal static IReadOnlyList<TvAIrPlugin.Viewers.TvAirViewerProfileDto> ListProfiles()

@@ -679,12 +679,15 @@ body.aircon-runtime-root{position:static;}
     // ContentRoute is a Plugin navigation path, never a bare query string.
     // Keep the existing route when the Viewer Profile is intentionally absent
     // (e.g. a wave without a configured viewer).
-    private static string BuildViewerContentRoute(string wave, string? viewerProfile)
+    private static string BuildViewerContentRoute(string wave, string? viewerProfile, bool waveNavigation = false)
     {
         var route = "/plugin/aircon?wave=" + Url(wave);
-        return string.IsNullOrWhiteSpace(viewerProfile)
-            ? route
-            : route + "&viewerProfile=" + Url(viewerProfile);
+        if (!string.IsNullOrWhiteSpace(viewerProfile))
+            route += "&viewerProfile=" + Url(viewerProfile);
+        // This belongs to the shared content-route authority. It is not a
+        // second rendering path or a browser-side visual override.
+        if (waveNavigation) route += "&waveNavigation=1";
+        return route;
     }
 
     private static string Url(string value) => WebUtility.UrlEncode(value);
